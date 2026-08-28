@@ -1,50 +1,71 @@
 %YAML:1.0
 
-#--------------------------------------------------------------------------------------------
-# Camera Parameters. Adjust them!
-#--------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------
+# ORB-SLAM2 monocular settings for the DJI Tello.
+#
+# READ THIS BEFORE USING IT ON YOUR DRONE
+#
+# 1. These intrinsics describe the FULL 960x720 stream. If you launch the
+#    driver with video_scale != 1.0, the published images are smaller and
+#    these numbers are wrong by exactly that factor. Scale fx, fy and
+#    (cx + 0.5), (cy + 0.5) by the same s -- ORB-SLAM2 reads this file, it does
+#    NOT listen to /camera_info, so nothing will warn you.
+#
+# 2. The distortion values below came with the upstream repository and are
+#    from somebody else's airframe. Note in particular that p1 = -0.023 is a
+#    very large tangential term -- physically it means the sensor is tilted
+#    several degrees relative to the lens axis, which is not typical and more
+#    likely indicates an under-constrained calibration (too few views, or all
+#    views at a similar pose). Re-calibrate your own drone before trusting any
+#    metric result:
+#
+#      ros2 run camera_calibration cameracalibrator \
+#          --size 8x6 --square 0.025 image:=/image_raw camera:=/camera
+#
+#    Collect views across the whole image, at several distances, and with real
+#    tilt -- a target held flat and centred gives a confident, wrong answer.
+#---------------------------------------------------------------------------
 
-# Camera calibration and distortion parameters (OpenCV) 
 Camera.fx: 919.424717
 Camera.fy: 911.926190
 Camera.cx: 459.655779
 Camera.cy: 323.551997
 
+# OpenCV order is [k1, k2, p1, p2, k3]; ORB-SLAM2 names them individually.
 Camera.k1: -0.041948
 Camera.k2: 0.048619
 Camera.p1: -0.022789
 Camera.p2: -0.004038
 Camera.k3: 0.0
 
-# Camera frames per second 
+# Nominal stream rate. The Tello advertises 30 fps but delivers less over a
+# congested 2.4 GHz link; ORB-SLAM2 uses this only for keyframe-insertion
+# heuristics, so being optimistic here makes it insert keyframes too eagerly.
 Camera.fps: 30.0
 
-# Color order of the images (0: BGR, 1: RGB. It is ignored if images are grayscale)
+# 0: BGR, 1: RGB. Ignored here -- the wrapper converts to grayscale before
+# calling TrackMonocular, precisely so this setting cannot cause a silent bug.
 Camera.RGB: 0
 
-#--------------------------------------------------------------------------------------------
-# ORB Parameters
-#--------------------------------------------------------------------------------------------
-
-# ORB Extractor: Number of features per image
+#---------------------------------------------------------------------------
+# ORB extractor
+#
+# 1000 features on a 960x720 frame is the ORB-SLAM2 default and is a reasonable
+# CPU/robustness trade for a laptop. If the Tello's soft, compressed image
+# yields too few corners indoors, LOWER the FAST thresholds before raising
+# nFeatures: extra features on a low-contrast image are mostly noise, and they
+# cost time in both extraction and matching.
+#---------------------------------------------------------------------------
 ORBextractor.nFeatures: 1000
-
-# ORB Extractor: Scale factor between levels in the scale pyramid 	
 ORBextractor.scaleFactor: 1.2
-
-# ORB Extractor: Number of levels in the scale pyramid	
 ORBextractor.nLevels: 8
-
-# ORB Extractor: Fast threshold
-# Image is divided in a grid. At each cell FAST are extracted imposing a minimum response.
-# Firstly we impose iniThFAST. If no corners are detected we impose a lower value minThFAST
-# You can lower these values if your images have low contrast			
 ORBextractor.iniThFAST: 20
 ORBextractor.minThFAST: 7
 
-#--------------------------------------------------------------------------------------------
-# Viewer Parameters
-#--------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------
+# Viewer. Pangolin is not built in this fork; only Viewer.PointSize is read,
+# by the wrapper, to size the RViz map markers.
+#---------------------------------------------------------------------------
 Viewer.KeyFrameSize: 0.04
 Viewer.KeyFrameLineWidth: 1
 Viewer.GraphLineWidth: 0.9

@@ -1,69 +1,59 @@
 #!/bin/bash
+# Install ROS 2 Humble and this project's dependencies on Ubuntu 22.04 (jammy).
+#
+# The previous version installed ROS 2 Foxy (Ubuntu 20.04) into a repository
+# that targets Humble, using the deprecated apt-key mechanism. Both are fixed.
+set -euo pipefail
 
-if (( $EUID > 0 )); then
-	echo " - Please run as root"
-	exit
+SUDO=""
+if (( EUID != 0 )); then SUDO="sudo"; fi
+
+CODENAME="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-}")"
+if [[ "${CODENAME}" != "jammy" ]]; then
+  echo " ! This repository targets Ubuntu 22.04 (jammy) + ROS 2 Humble."
+  echo " ! Detected '${CODENAME}'. Continuing, but expect package mismatches."
 fi
 
-#Install ROS 2
-echo " - Installing ROS 2 Foxy"
+echo " - Locale"
+$SUDO apt update
+$SUDO apt install -y locales curl gnupg2 lsb-release software-properties-common
+$SUDO locale-gen en_US en_US.UTF-8
+$SUDO update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 
-echo " - Install Build Tools"
+echo " - ROS 2 apt source (signed-by keyring; apt-key is deprecated)"
+$SUDO add-apt-repository -y universe
+$SUDO curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+  -o /usr/share/keyrings/ros-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+http://packages.ros.org/ros2/ubuntu ${CODENAME} main" | \
+  $SUDO tee /etc/apt/sources.list.d/ros2.list > /dev/null
 
-# C++ Build tools
-apt install build-essential gdb
+echo " - ROS 2 Humble"
+$SUDO apt update
+$SUDO apt install -y \
+  ros-humble-desktop ros-dev-tools \
+  ros-humble-cv-bridge ros-humble-vision-opencv \
+  ros-humble-tf2-ros ros-humble-tf2-geometry-msgs \
+  ros-humble-camera-calibration ros-humble-camera-calibration-parsers \
+  ros-humble-camera-info-manager ros-humble-image-transport \
+  ros-humble-rqt-image-view ros-humble-rqt-robot-monitor \
+  ros-humble-diagnostic-msgs \
+  python3-colcon-common-extensions python3-rosdep python3-argcomplete \
+  python3-numpy python3-opencv python3-yaml \
+  build-essential cmake git
 
-# Set UTF-8 charset
-apt update
-apt install -y locales
-locale-gen en_US en_US.UTF-8
-update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-export LANG=en_US.UTF-8
-
-echo " - ROS 2 sources"
-
-# Add ROS2 sources
-apt update
-apt install -y curl gnupg2 lsb-release
-curl -s https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc | apt-key add -
-sh -c 'echo "deb [arch=$(dpkg --print-architecture)] http://packages.ros.org/ros2/ubuntu $(lsb_release -cs) main" > /etc/apt/sources.list.d/ros2-latest.list'
-
-echo " - Install ROS 2"
-
-# Install ROS 2 (foxy)
-apt update
-apt install -y ros-foxy-desktop
-
-# Step envrioment
-source /opt/ros/foxy/setup.bash
-
-echo " - Install Python ROS 2"
-
-# Argcomplete
-apt install -y python3-pip
-pip3 install -U argcomplete
-
-# Colcon build tools
-apt install -y python3-colcon-common-extensions python3-rosdep2
-
-# Update ROS dep
+echo " - rosdep"
+$SUDO rosdep init 2>/dev/null || true
 rosdep update
-rosdep fix-permissions
 
-# Add to bashrc
-echo " - Register ROS 2 in .bashrc"
-echo "source /opt/ros/foxy/setup.bash" >> ~/.bashrc
-echo "source /usr/share/colcon_cd/function/colcon_cd.sh" >> ~/.bashrc
-echo "export _colcon_cd_root=~/ros2_install" >> ~/.bashrc
-source ~/.bashrc
+echo " - Python dependencies (user install; use a venv if you prefer)"
+python3 -m pip install --user --upgrade djitellopy av
 
-# Install project dependencies
-echo " - Python dependencies"
-pip3 install catkin_pkg rospkg av image opencv-python djitellopy2 pyyaml
-apt install python3-tf*
+if ! grep -q "source /opt/ros/humble/setup.bash" ~/.bashrc 2>/dev/null; then
+  echo "source /opt/ros/humble/setup.bash" >> ~/.bashrc
+  echo " - Added the Humble setup to ~/.bashrc"
+fi
 
-echo " - CPP dependencies"
-apt install ros-foxy-ament-cmake* ros-foxy-tf2* ros-foxy-rclcpp* ros-foxy-rosgraph*
-
-echo " - Rviz and RQT Tools"
-apt install ros-foxy-rviz* ros-foxy-rqt*
+echo
+echo "Done. Open a new shell (or 'source /opt/ros/humble/setup.bash'), then:"
+echo "  ./scripts/build.sh"

@@ -1,15 +1,68 @@
 #!/usr/bin/env python3
+"""ROS 2 driver for the DJI Tello.
 
+Rewritten around three properties of this aircraft that the obvious
+implementation gets wrong, each of which was reachable in flight:
+
+**1. Every djitellopy command is a blocking UDP round trip.**
+``takeoff()``, ``land()``, ``flip()`` and the ``query_*`` calls send a datagram
+and block up to ``RESPONSE_TIMEOUT`` seconds, retrying three times. Running any
+of them inside a ROS callback on a single-threaded executor freezes the whole
+node -- including the ``/emergency`` subscription and the RC dead-man timer --
+for up to 21 seconds. A drone commanded forward keeps flying forward for that
+entire window because no zeroing ``rc`` packet goes out. All blocking commands
+therefore run on a dedicated worker thread (:meth:`_command_worker`), and
+``/emergency`` additionally bypasses the queue with a fire-and-forget datagram.
+
+**2. Telemetry is a broadcast, not a poll.**
+The SDK pushes state at ~10 Hz. Sampling it on an independent 10 Hz timer
+beats one aperiodic stream against another: you get duplicated samples,
+dropped samples, and -- worst of all -- a timestamp that is the *timer's* firing
+instant rather than the packet's arrival, displaced by an unbounded 0-100 ms.
+A fixed camera-IMU offset can be calibrated out; a randomly varying one cannot.
+This driver polls at 50 Hz and publishes only on an observed change, stamping at
+detection, which bounds the timestamp error to the 20 ms poll period.
+
+**3. The units and axes in the SDK state packet are not ROS units and axes.**
+Accelerations are milli-g in an FRD body frame; attitude is NED-referenced with
+yaw increasing clockwise. ROS mandates SI in FLU/ENU (REP-103). Publishing the
+raw values -- as ``/imu`` previously did -- yields ``z = -10 m/s^2`` at rest and a
+yaw that runs backwards, which any downstream estimator will faithfully
+integrate into nonsense. Conversions live in
+:mod:`tello_vio.tello_model` and are mirrored here so this package has no
+dependency on ``tello_vio``.
+
+Topics
+------
+Published: ``/image_raw``, ``/camera_info``, ``/imu``, ``/odom``, ``/tof``,
+``/status``, ``/id``, ``/battery``, ``/temperature``.
+Subscribed: ``/takeoff``, ``/land``, ``/emergency``, ``/control``, ``/cmd_vel``,
+``/flip``, ``/wifi_config``.
+"""
+
+from __future__ import annotations
+
+import errno
+import logging
 import math
-import rclpy
-import numpy
+import queue
+import threading
 import time
+from typing import Optional
+
+import numpy
+import rclpy
 import tf2_ros
 import yaml
-from typing import Optional
-import logging
-
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import TransformStamped, Twist
+from nav_msgs.msg import Odometry
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import (BatteryState, CameraInfo, Image, Imu, Range,
+                             Temperature)
+from std_msgs.msg import Empty, String
 
 try:
     from djitellopy import Tello
@@ -20,507 +73,866 @@ except ModuleNotFoundError as e:
         "or inside your venv, then rebuild/re-source your workspace."
     ) from e
 
-from tello_msg.msg import TelloStatus, TelloID, TelloWifiConfig
-from std_msgs.msg import Empty, String
-from sensor_msgs.msg import Image, Imu, BatteryState, Temperature, CameraInfo
-from geometry_msgs.msg import Twist, TransformStamped
-from nav_msgs.msg import Odometry
-from ament_index_python.packages import get_package_share_directory
+from tello_msg.msg import TelloID, TelloStatus, TelloWifiConfig
 
-# Reduce djitellopy log spam (rc commands, etc.)
+# djitellopy logs every rc packet at INFO, which at 20 Hz drowns the console.
 logging.getLogger("djitellopy").setLevel(logging.WARNING)
 
-# CvBridge is preferred when available, but this project can also run without it.
 try:
-    from cv_bridge import CvBridge  # type: ignore
-except Exception:
-    CvBridge = None  # type: ignore
+    import cv2
+except Exception:                                   # pragma: no cover
+    cv2 = None
 
-# Tello ROS node class, inherits from the Tello controller object.
-#
-# Can be configured to be used by multiple drones, publishes, all data collected from the drone and provides control using ROS messages.
-class TelloNode():
+try:
+    from cv_bridge import CvBridge
+except Exception:                                   # pragma: no cover
+    CvBridge = None
+
+#: Standard gravity, m/s^2.
+G0 = 9.80665
+#: SDK accelerations are milli-g.
+MILLI_G_TO_MPS2 = G0 / 1000.0
+#: FRD (drone) -> FLU (ROS). A 180 deg rotation about the body x axis.
+FRD_TO_FLU = numpy.diag([1.0, -1.0, -1.0])
+DEG = math.pi / 180.0
+
+
+class TelloNode:
+
     def __init__(self, node):
-        # ROS node
         self.node = node
+        self._shutdown = threading.Event()
 
-        # Timers (keep references so they won't get GC'd)
-        self._video_timer = None
-        self._odom_timer = None
-        self._status_timer = None
-        self._rc_timer = None
+        # ------------------------- parameters --------------------------- #
+        p = node.declare_parameter
+        p('connect_timeout', 10.0)
+        p('tello_ip', '192.168.10.1')
+        p('tf_base', 'odom')
+        p('tf_drone', 'base_link')
+        p('camera_frame', 'camera_optical')
+        p('tf_pub', False)
+        p('camera_info_file', '')
+        p('video_scale', 1.0)
+        p('video_target_fps', 30.0)
+        p('rc_rate_hz', 20.0)
+        p('rc_timeout_sec', 0.35)
+        p('telemetry_poll_hz', 50.0)
+        p('speed_to_mps', 0.1)
+        p('publish_bgr', True)
+        p('video_stall_timeout', 3.0)
+        p('video_auto_restart', True)
 
-        # Frame reader / image conversion
-        self._frame_read = None
-        self._bridge = CvBridge() if CvBridge is not None else None
+        g = lambda n: node.get_parameter(n).value
+        self.connect_timeout = float(g('connect_timeout'))
+        self.tello_ip = str(g('tello_ip'))
+        self.tf_base = str(g('tf_base'))
+        self.tf_drone = str(g('tf_drone'))
+        self.camera_frame = str(g('camera_frame'))
+        self.tf_pub = bool(g('tf_pub'))
+        self.camera_info_file = str(g('camera_info_file'))
+        self.video_scale = float(g('video_scale'))
+        self.video_target_fps = float(g('video_target_fps'))
+        self.rc_rate_hz = float(g('rc_rate_hz'))
+        self.rc_timeout_sec = float(g('rc_timeout_sec'))
+        self.telemetry_poll_hz = float(g('telemetry_poll_hz'))
+        self.speed_to_mps = float(g('speed_to_mps'))
+        self.publish_bgr = bool(g('publish_bgr'))
+        self.video_stall_timeout = max(1.0, float(g('video_stall_timeout')))
+        self.video_auto_restart = bool(g('video_auto_restart'))
 
-        # Control state (deadman)
-        self._rc_last_time = 0.0
-        self._rc = (0, 0, 0, 0)  # lr, fb, ud, yaw in [-100..100]
-
-        # Video publish diagnostics
-        self._video_pub_count = 0
-        self._video_pub_first_ts: Optional[float] = None
-        self._video_pub_last_log_ts: float = 0.0
-
-        # Declare parameters
-        self.node.declare_parameter('connect_timeout', 10.0)
-        self.node.declare_parameter('tello_ip', '192.168.10.1')
-        self.node.declare_parameter('tf_base', 'map')
-        self.node.declare_parameter('tf_drone', 'drone')
-        self.node.declare_parameter('tf_pub', False)
-        self.node.declare_parameter('camera_info_file', '')
-        self.node.declare_parameter('video_scale', 1.0)
-        self.node.declare_parameter('video_target_fps', 30.0)
-        self.node.declare_parameter('rc_rate_hz', 20.0)
-        self.node.declare_parameter('rc_timeout_sec', 0.35)
-
-        # Get parameters
-        self.connect_timeout = float(self.node.get_parameter('connect_timeout').value)
-        self.tello_ip = str(self.node.get_parameter('tello_ip').value)
-        self.tf_base = str(self.node.get_parameter('tf_base').value)
-        self.tf_drone = str(self.node.get_parameter('tf_drone').value)
-        self.tf_pub = bool(self.node.get_parameter('tf_pub').value)
-        self.camera_info_file = str(self.node.get_parameter('camera_info_file').value)
-        self.video_scale = float(self.node.get_parameter('video_scale').value)
-        self.video_target_fps = float(self.node.get_parameter('video_target_fps').value)
-        self.rc_rate_hz = float(self.node.get_parameter('rc_rate_hz').value)
-        self.rc_timeout_sec = float(self.node.get_parameter('rc_timeout_sec').value)
-        if self.video_scale <= 0.0:
+        if not (0.0 < self.video_scale <= 1.0):
+            node.get_logger().warn(
+                f"video_scale={self.video_scale} out of (0, 1]; using 1.0")
             self.video_scale = 1.0
-        if self.video_target_fps <= 1.0:
-            self.video_target_fps = 30.0
-        if self.rc_rate_hz <= 1.0:
-            self.rc_rate_hz = 20.0
-        if self.rc_timeout_sec <= 0.05:
-            self.rc_timeout_sec = 0.35
+        self.video_target_fps = max(1.0, self.video_target_fps)
+        self.rc_rate_hz = max(1.0, self.rc_rate_hz)
+        self.rc_timeout_sec = max(0.05, self.rc_timeout_sec)
+        self.telemetry_poll_hz = min(200.0, max(10.0, self.telemetry_poll_hz))
 
-        # Camera information loaded from calibration yaml
-        self.camera_info = None
-        
-        # Check if camera info file was received as argument
-        if len(self.camera_info_file) == 0:
-            share_directory = get_package_share_directory('tello')
-            self.camera_info_file = share_directory + '/ost.yaml'
+        if self.video_scale != 1.0 and cv2 is None:
+            node.get_logger().warn(
+                "video_scale < 1 requested but OpenCV is unavailable; falling "
+                "back to stride subsampling, which ALIASES the image and "
+                "measurably degrades feature detection. Install python3-opencv.")
 
-        # Read camera info from YAML file
-        with open(self.camera_info_file, 'r') as file:
-            self.camera_info = yaml.safe_load(file)
+        # ------------------------- camera info -------------------------- #
+        if not self.camera_info_file:
+            self.camera_info_file = get_package_share_directory('tello') + '/ost.yaml'
+        with open(self.camera_info_file, 'r') as f:
+            self.camera_info_raw = yaml.safe_load(f) or {}
+        self._camera_info_cache: Optional[CameraInfo] = None
 
-        # Configure drone connection
-        Tello.TELLO_IP = self.tello_ip
-        Tello.RESPONSE_TIMEOUT = int(self.connect_timeout)
+        # ------------------------- connect ------------------------------ #
+        # The IP must go through the constructor: djitellopy binds the address
+        # in __init__, so assigning Tello.TELLO_IP afterwards has no effect.
+        # Likewise RESPONSE_TIMEOUT is captured as a default argument value at
+        # import time, so it cannot be overridden by a class attribute either;
+        # the timeout is passed per call instead.
+        node.get_logger().info(f'Tello: connecting to {self.tello_ip}')
+        try:
+            self.tello = Tello(host=self.tello_ip)
+        except TypeError:                            # very old djitellopy
+            Tello.TELLO_IP = self.tello_ip
+            self.tello = Tello()
+        except OSError as e:
+            # djitellopy binds UDP :8889 in Tello.__init__. EADDRINUSE here does
+            # NOT mean the drone is unreachable -- it means another process on
+            # this machine already owns the socket, almost always a previous
+            # driver that outlived its launch. Say so, because the raw errno
+            # sends people off debugging their WiFi for an hour.
+            if e.errno == errno.EADDRINUSE:
+                raise RuntimeError(
+                    'UDP port 8889 is already in use, so this driver cannot open '
+                    'the Tello command socket.\n'
+                    '  This is NOT a connectivity problem: the drone and your WiFi '
+                    'are irrelevant here.\n'
+                    '  A previous tello driver is still running. Find and stop it:\n'
+                    "    ss -lunp | grep 8889\n"
+                    "    pkill -f 'lib/tello/tello'\n"
+                    '  Then relaunch.') from e
+            raise
+        # `connect_timeout` cannot be honoured the obvious way: djitellopy
+        # binds RESPONSE_TIMEOUT as a *default argument value* at import time,
+        # so assigning to the class attribute changes nothing. What is
+        # adjustable is the retry count, which multiplies the fixed 7 s
+        # per-attempt timeout -- so we translate the requested budget into a
+        # retry count and say what we actually did.
+        per_try = float(getattr(Tello, 'RESPONSE_TIMEOUT', 7))
+        tries = max(1, int(round(self.connect_timeout / max(1e-6, per_try))))
+        self.tello.retry_count = tries
+        node.get_logger().info(
+            f'Tello: response timeout is {per_try:.0f}s per attempt (fixed by '
+            f'djitellopy); using {tries} attempt(s) for a ~{tries*per_try:.0f}s budget')
+        try:
+            self.tello.connect()
+        except Exception as e:
+            raise RuntimeError(
+                f'No response from the drone at {self.tello_ip}.\n'
+                '  Check: the Tello is powered on (blinking LED), and this machine '
+                'is joined to its WiFi access point (TELLO-XXXXXX).\n'
+                '  On WSL2, confirm Windows is on the Tello AP -- WSL shares the '
+                'host network.\n'
+                f'  Original error: {e}') from e
+        node.get_logger().info('Tello: connected')
 
-        # Connect to drone
-        self.node.get_logger().info('Tello: Connecting to drone')
-
-        self.tello = Tello()
-        self.tello.connect()
-
-        self.node.get_logger().info('Tello: Connected to drone')
-
-        # Initialize video before starting timers
         self.tello.streamon()
         try:
+            # with_queue=False keeps only the most recent decoded frame. A queue
+            # would buffer frames and add latency on top of the ~200 ms the
+            # WiFi link already costs, which is the opposite of what VIO needs.
             self._frame_read = self.tello.get_frame_read(with_queue=False)
         except TypeError:
             self._frame_read = self.tello.get_frame_read()
 
-        # Publishers and subscribers
+        # ------------------------- state -------------------------------- #
+        self._bridge = CvBridge() if CvBridge is not None else None
+        self._rc = (0, 0, 0, 0)
+        self._rc_last_time = 0.0
+        self._prev_state: Optional[dict] = None
+        # Hold a REFERENCE to the last frame we published, not a hash of it.
+        # djitellopy replaces BackgroundFrameRead.frame with a brand-new numpy
+        # array on every successful decode, so object identity is an exact
+        # new-frame test. Hashing sampled pixels (the previous approach) reports
+        # false duplicates whenever the scene is static -- pointing the drone at
+        # a wall was enough to make it discard most real frames -- and holding
+        # the reference additionally stops CPython recycling the buffer address.
+        self._prev_frame_obj = None
+        self._resize_cache = None
+        self._video_pub_count = 0
+        self._video_win_count = 0
+        self._video_win_start = 0.0
+        self._video_last_log = 0.0
+        self._duplicate_frames = 0
+        self._last_new_frame_t = 0.0
+        self._video_restarts = 0
+        self._video_restart_pending = False
+        self._identity = None
+        self._wifi_snr = ''
+
+        # Blocking SDK commands run here, never on an executor thread.
+        self._cmd_q: "queue.Queue" = queue.Queue()
+        self._cmd_thread = threading.Thread(target=self._command_worker,
+                                            name='tello-cmd', daemon=True)
+        self._cmd_thread.start()
+
         self.setup_publishers()
         self.setup_subscribers()
 
-        # Timers (ROS 2 idiomatic, non-blocking)
-        self._video_timer = self.node.create_timer(1.0 / float(self.video_target_fps), self._on_video_timer)
-        self._odom_timer = self.node.create_timer(1.0 / 10.0, self._on_odom_timer)
-        self._status_timer = self.node.create_timer(1.0 / 2.0, self._on_status_timer)
-        self._rc_timer = self.node.create_timer(1.0 / float(self.rc_rate_hz), self._on_rc_timer)
+        # Callback groups: video decode and telemetry must not block each other,
+        # and neither may delay the RC dead-man. Requires MultiThreadedExecutor.
+        self.cg_video = MutuallyExclusiveCallbackGroup()
+        self.cg_telemetry = MutuallyExclusiveCallbackGroup()
+        self.cg_control = MutuallyExclusiveCallbackGroup()
 
-        self.node.get_logger().info('Tello: Driver node ready')
+        self._video_timer = node.create_timer(
+            1.0 / self.video_target_fps, self._on_video_timer, callback_group=self.cg_video)
+        self._telemetry_timer = node.create_timer(
+            1.0 / self.telemetry_poll_hz, self._on_telemetry_timer,
+            callback_group=self.cg_telemetry)
+        self._slow_timer = node.create_timer(
+            2.0, self._on_slow_timer, callback_group=self.cg_telemetry)
+        self._rc_timer = node.create_timer(
+            1.0 / self.rc_rate_hz, self._on_rc_timer, callback_group=self.cg_control)
 
-    # Setup ROS publishers of the node.
+        if self.tf_pub:
+            self._static_tf = tf2_ros.StaticTransformBroadcaster(node)
+            node.get_logger().warn(
+                "tf_pub=true: this driver publishes only the static "
+                f"{self.tf_drone} -> {self.camera_frame} edge. It never "
+                f"publishes {self.tf_base} -> {self.tf_drone}, which belongs to "
+                "the state estimator; two publishers on one TF edge is a broken "
+                "tree.")
+            self._publish_static_camera_tf()
+
+        self._cmd_q.put(('identify', ()))
+        node.get_logger().info('Tello: driver ready')
+
+    # ------------------------------------------------------------------ #
+    # ROS interface
+    # ------------------------------------------------------------------ #
+
     def setup_publishers(self):
-        # Use sensor data QoS to minimize latency (best effort, small depth).
-        self.pub_image_raw = self.node.create_publisher(Image, 'image_raw', qos_profile_sensor_data)
-        self.pub_camera_info = self.node.create_publisher(CameraInfo, 'camera_info', qos_profile_sensor_data)
-        self.pub_status = self.node.create_publisher(TelloStatus, 'status', 1)
-        self.pub_id = self.node.create_publisher(TelloID, 'id', 1)
-        self.pub_imu = self.node.create_publisher(Imu, 'imu', 1)
-        self.pub_battery = self.node.create_publisher(BatteryState, 'battery', 1)
-        self.pub_temperature = self.node.create_publisher(Temperature, 'temperature', 1)
-        self.pub_odom = self.node.create_publisher(Odometry, 'odom', 1)
+        n = self.node
+        self.pub_image_raw = n.create_publisher(Image, 'image_raw', qos_profile_sensor_data)
+        self.pub_camera_info = n.create_publisher(CameraInfo, 'camera_info',
+                                                  qos_profile_sensor_data)
+        self.pub_imu = n.create_publisher(Imu, 'imu', qos_profile_sensor_data)
+        self.pub_odom = n.create_publisher(Odometry, 'odom', qos_profile_sensor_data)
+        self.pub_tof = n.create_publisher(Range, 'tof', qos_profile_sensor_data)
+        self.pub_status = n.create_publisher(TelloStatus, 'status', 1)
+        self.pub_id = n.create_publisher(TelloID, 'id', 1)
+        self.pub_battery = n.create_publisher(BatteryState, 'battery', 1)
+        self.pub_temperature = n.create_publisher(Temperature, 'temperature', 1)
 
-        # TF broadcaster
-        if self.tf_pub:
-            self.tf_broadcaster = tf2_ros.TransformBroadcaster(self.node)
-    
-    # Setup the topic subscribers of the node.
     def setup_subscribers(self):
-        self.sub_emergency = self.node.create_subscription(Empty, 'emergency', self.cb_emergency, 1)
-        self.sub_takeoff = self.node.create_subscription(Empty, 'takeoff', self.cb_takeoff, 1)
-        self.sub_land = self.node.create_subscription(Empty, 'land', self.cb_land, 1)
-        self.sub_control = self.node.create_subscription(Twist, 'control', self.cb_control, 1)
-        self.sub_flip = self.node.create_subscription(String, 'flip', self.cb_flip, 1)
-        self.sub_wifi_config = self.node.create_subscription(TelloWifiConfig, 'wifi_config', self.cb_wifi_config, 1)
+        n = self.node
+        n.create_subscription(Empty, 'emergency', self.cb_emergency, 1)
+        n.create_subscription(Empty, 'takeoff', self.cb_takeoff, 1)
+        n.create_subscription(Empty, 'land', self.cb_land, 1)
+        n.create_subscription(Twist, 'control', self.cb_control, 1)
+        n.create_subscription(Twist, 'cmd_vel', self.cb_cmd_vel, 1)
+        n.create_subscription(String, 'flip', self.cb_flip, 1)
+        n.create_subscription(TelloWifiConfig, 'wifi_config', self.cb_wifi_config, 1)
 
-    # Get the orientation of the drone as a quaternion
-    def get_orientation_quaternion(self):
-        deg_to_rad = math.pi / 180.0
-        return euler_to_quaternion([
-            self.tello.get_yaw() * deg_to_rad,
-            self.tello.get_pitch() * deg_to_rad,
-            self.tello.get_roll() * deg_to_rad
-        ])
+    # ------------------------------------------------------------------ #
+    # blocking-command worker
+    # ------------------------------------------------------------------ #
 
-    def _on_odom_timer(self):
-        # TF
-        if self.tf_pub:
-            t = TransformStamped()
-            t.header.stamp = self.node.get_clock().now().to_msg()
-            t.header.frame_id = self.tf_base
-            t.child_frame_id = self.tf_drone
-            t.transform.translation.x = 0.0
-            t.transform.translation.y = 0.0
-            t.transform.translation.z = (self.tello.get_barometer()) / 100.0
-            self.tf_broadcaster.sendTransform(t)
+    def _command_worker(self):
+        """Serialise every blocking SDK call onto one non-ROS thread.
 
-        if self.pub_imu.get_subscription_count() > 0:
-            q = self.get_orientation_quaternion()
-            msg = Imu()
-            msg.header.stamp = self.node.get_clock().now().to_msg()
-            msg.header.frame_id = self.tf_drone
-            msg.linear_acceleration.x = self.tello.get_acceleration_x() / 100.0
-            msg.linear_acceleration.y = self.tello.get_acceleration_y() / 100.0
-            msg.linear_acceleration.z = self.tello.get_acceleration_z() / 100.0
-            msg.orientation.x = q[0]
-            msg.orientation.y = q[1]
-            msg.orientation.z = q[2]
-            msg.orientation.w = q[3]
-            self.pub_imu.publish(msg)
+        The Tello's command socket is single-threaded by protocol -- two
+        outstanding commands corrupt each other's responses -- so a single
+        worker is both the safe and the correct design.
+        """
+        while not self._shutdown.is_set():
+            try:
+                cmd, args = self._cmd_q.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._run_command(cmd, args)
+            except Exception as e:
+                self.node.get_logger().warn(f"{cmd} failed: {e}")
+            finally:
+                self._cmd_q.task_done()
 
-        if self.pub_odom.get_subscription_count() > 0:
-            q = self.get_orientation_quaternion()
-            odom_msg = Odometry()
-            odom_msg.header.stamp = self.node.get_clock().now().to_msg()
-            odom_msg.header.frame_id = self.tf_base
-            odom_msg.pose.pose.orientation.x = q[0]
-            odom_msg.pose.pose.orientation.y = q[1]
-            odom_msg.pose.pose.orientation.z = q[2]
-            odom_msg.pose.pose.orientation.w = q[3]
-            odom_msg.twist.twist.linear.x = float(self.tello.get_speed_x()) / 100.0
-            odom_msg.twist.twist.linear.y = float(self.tello.get_speed_y()) / 100.0
-            odom_msg.twist.twist.linear.z = float(self.tello.get_speed_z()) / 100.0
-            self.pub_odom.publish(odom_msg)
+    def _run_command(self, cmd, args):
+        log = self.node.get_logger()
+        if cmd == 'takeoff':
+            log.info('takeoff')
+            self.tello.takeoff()
+        elif cmd == 'land':
+            log.info('land')
+            self.tello.land()
+        elif cmd == 'emergency':
+            self.tello.emergency()
+        elif cmd == 'flip':
+            self.tello.flip(args[0])
+        elif cmd == 'wifi':
+            self.tello.set_wifi_credentials(args[0], args[1])
+        elif cmd == 'identify':
+            # Static for the life of the connection: query once, not at 2 Hz.
+            # Older firmware answers "unknown command: sdk?" instead of raising,
+            # so the error arrives as a perfectly ordinary string. Publishing it
+            # as a version number would be worse than admitting we do not know.
+            def _clean(v):
+                text = str(v).strip()
+                return 'unsupported' if 'unknown command' in text.lower() else text
 
-    def _on_status_timer(self):
-        # Battery
+            sdk = _clean(self.tello.query_sdk_version())
+            serial = _clean(self.tello.query_serial_number())
+            self._identity = (sdk, serial)
+            if sdk == 'unsupported' or serial == 'unsupported':
+                log.info('Tello firmware does not support sdk?/sn? queries '
+                         '(harmless: these are identification only)')
+            else:
+                log.info(f'Tello SDK {sdk} serial {serial}')
+        elif cmd == 'wifi_snr':
+            self._wifi_snr = str(self.tello.query_wifi_signal_noise_ratio())
+        elif cmd == 'restart_video':
+            # streamoff/streamon are blocking SDK round trips, which is exactly
+            # why this runs on the worker thread and not in the video timer.
+            try:
+                try:
+                    self._frame_read.stop()
+                except Exception:
+                    pass
+                self.tello.streamoff()
+                time.sleep(0.5)
+                self.tello.streamon()
+                try:
+                    self._frame_read = self.tello.get_frame_read(with_queue=False)
+                except TypeError:
+                    self._frame_read = self.tello.get_frame_read()
+                self._prev_frame_obj = None
+                self._last_new_frame_t = time.time()
+                self._video_restarts += 1
+                log.info(f'Video stream restarted (#{self._video_restarts})')
+            finally:
+                self._video_restart_pending = False
+
+    # ------------------------------------------------------------------ #
+    # telemetry
+    # ------------------------------------------------------------------ #
+
+    def _on_telemetry_timer(self):
+        """Poll the SDK state and publish only when the packet actually changed.
+
+        djitellopy's receiver thread overwrites one dict, with no sequence
+        number, so change detection is the only way to distinguish a fresh
+        packet from a re-read of the previous one. Polling faster than the
+        broadcast (50 Hz vs ~10 Hz) bounds the stamping error to one poll
+        period instead of one telemetry period.
+        """
+        try:
+            state = self.tello.get_current_state()
+        except Exception:
+            return
+        if not state or state == self._prev_state:
+            return
+        self._prev_state = dict(state)
+        stamp = self.node.get_clock().now().to_msg()
+
+        def f(key, default=0.0):
+            try:
+                return float(state.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        accel_frd = numpy.array([f('agx'), f('agy'), f('agz')]) * MILLI_G_TO_MPS2
+        accel_flu = FRD_TO_FLU @ accel_frd
+        vel_frd = numpy.array([f('vgx'), f('vgy'), f('vgz')]) * self.speed_to_mps
+        vel_flu = FRD_TO_FLU @ vel_frd
+        roll_d, pitch_d, yaw_d = f('roll'), f('pitch'), f('yaw')
+        q = self._attitude_quaternion(roll_d, pitch_d, yaw_d)
+
+        self._publish_imu(stamp, accel_flu, q)
+        self._publish_odom(stamp, vel_flu, q)
+        self._publish_tof(stamp, f('tof'))
+        self._publish_status(stamp, state, accel_frd, vel_frd, roll_d, pitch_d, yaw_d)
+
+    @staticmethod
+    def _attitude_quaternion(roll_deg, pitch_deg, yaw_deg):
+        """SDK NED-referenced Euler angles -> ROS ENU-referenced quaternion.
+
+        The SDK reports the FRD body attitude against a NED world frame; ROS
+        wants FLU against ENU. Composing both frame flips negates pitch and yaw
+        and leaves roll alone. The remaining constant 90 deg heading difference
+        between NED-north and ENU-east is moot: the Tello has no usable
+        magnetometer, so its yaw origin is wherever it was pointing at power-on.
+        """
+        roll = roll_deg * DEG
+        pitch = -pitch_deg * DEG
+        yaw = -yaw_deg * DEG
+        cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+        cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+        cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+        # Hamilton quaternion for R = Rz(yaw) Ry(pitch) Rx(roll), (x, y, z, w).
+        return (
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+            cr * cp * cy + sr * sp * sy,
+        )
+
+    def _publish_imu(self, stamp, accel_flu, q):
+        if self.pub_imu.get_subscription_count() == 0:
+            return
+        msg = Imu()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.tf_drone
+        msg.orientation.x, msg.orientation.y, msg.orientation.z, msg.orientation.w = q
+        msg.linear_acceleration.x = float(accel_flu[0])
+        msg.linear_acceleration.y = float(accel_flu[1])
+        msg.linear_acceleration.z = float(accel_flu[2])
+
+        # The Tello exposes NO gyroscope: the state packet carries fused
+        # attitude only. ROS defines covariance[0] = -1 as "this field is not
+        # measured"; leaving the field zero with a zero covariance instead --
+        # as this driver used to -- advertises an *exact* measurement of zero
+        # angular rate, which any consumer will believe and integrate.
+        msg.angular_velocity_covariance[0] = -1.0
+
+        # Orientation: roll/pitch are gravity-referenced and good to a couple of
+        # degrees; yaw free-runs with no absolute reference, so it gets a much
+        # larger variance. Values are placeholders until imu_calib is run.
+        rp_var = (2.0 * DEG) ** 2
+        yaw_var = (15.0 * DEG) ** 2
+        msg.orientation_covariance = [rp_var, 0.0, 0.0,
+                                      0.0, rp_var, 0.0,
+                                      0.0, 0.0, yaw_var]
+        a_var = 0.08 ** 2 * 10.0     # density^2 * rate, for the ~10 Hz stream
+        msg.linear_acceleration_covariance = [a_var, 0.0, 0.0,
+                                              0.0, a_var, 0.0,
+                                              0.0, 0.0, a_var]
+        self.pub_imu.publish(msg)
+
+    def _publish_odom(self, stamp, vel_flu, q):
+        if self.pub_odom.get_subscription_count() == 0:
+            return
+        msg = Odometry()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.tf_base
+        # REP-105: twist is expressed in child_frame_id. Leaving it empty makes
+        # the message unusable to robot_localization, whose transform lookup
+        # fails on an empty frame id and silently drops the measurement.
+        msg.child_frame_id = self.tf_drone
+        msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, \
+            msg.pose.pose.orientation.z, msg.pose.pose.orientation.w = q
+        # This driver has no position source. Advertise the pose position as
+        # unavailable rather than publishing a confident zero at the origin,
+        # which would fight any real estimator fusing the same topic.
+        cov = [0.0] * 36
+        cov[0] = -1.0
+        msg.pose.covariance = cov
+        msg.twist.twist.linear.x = float(vel_flu[0])
+        msg.twist.twist.linear.y = float(vel_flu[1])
+        msg.twist.twist.linear.z = float(vel_flu[2])
+        tcov = [0.0] * 36
+        v_var = 0.15 ** 2
+        tcov[0], tcov[7], tcov[14] = v_var, v_var, v_var
+        # Angular twist is not measured (there is no gyro). ROS only defines the
+        # "unavailable" flag for element 0 of the whole array, and element 0 is
+        # a real measurement here, so the honest encoding is a variance large
+        # enough that any sane filter gives the angular block no weight.
+        big = 1e6
+        tcov[21], tcov[28], tcov[35] = big, big, big
+        msg.twist.covariance = tcov
+        self.pub_odom.publish(msg)
+
+    def _publish_tof(self, stamp, tof_cm):
+        if self.pub_tof.get_subscription_count() == 0:
+            return
+        msg = Range()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.tf_drone
+        msg.radiation_type = Range.INFRARED
+        msg.field_of_view = 0.44          # ~25 deg cone, VL53L0X-class sensor
+        msg.min_range = 0.10
+        msg.max_range = 1.20
+        r = float(tof_cm) / 100.0
+        # Out-of-range readings are signalled by +inf, per sensor_msgs/Range,
+        # rather than being published as a plausible-looking number.
+        msg.range = r if msg.min_range <= r <= msg.max_range else float('inf')
+        self.pub_tof.publish(msg)
+
+    def _publish_status(self, stamp, state, accel_frd, vel_frd, roll, pitch, yaw):
+        def i(key):
+            try:
+                return int(float(state.get(key, 0)))
+            except (TypeError, ValueError):
+                return 0
+
         if self.pub_battery.get_subscription_count() > 0:
-            msg = BatteryState()
-            msg.header.stamp = self.node.get_clock().now().to_msg()
-            msg.header.frame_id = self.tf_drone
-            msg.percentage = float(self.tello.get_battery()) / 100.0
-            msg.voltage = 3.8
-            msg.design_capacity = 1.1
-            msg.present = True
-            msg.power_supply_technology = 2  # POWER_SUPPLY_TECHNOLOGY_LION
-            msg.power_supply_status = 2  # POWER_SUPPLY_STATUS_DISCHARGING
-            self.pub_battery.publish(msg)
+            m = BatteryState()
+            m.header.stamp = stamp
+            m.header.frame_id = self.tf_drone
+            m.percentage = i('bat') / 100.0
+            m.voltage = float('nan')          # not reported by the SDK
+            m.current = float('nan')
+            m.charge = float('nan')
+            m.capacity = float('nan')
+            m.design_capacity = 1.1
+            m.present = True
+            m.power_supply_technology = BatteryState.POWER_SUPPLY_TECHNOLOGY_LION
+            m.power_supply_status = BatteryState.POWER_SUPPLY_STATUS_DISCHARGING
+            self.pub_battery.publish(m)
 
-        # Temperature
         if self.pub_temperature.get_subscription_count() > 0:
-            msg = Temperature()
-            msg.header.stamp = self.node.get_clock().now().to_msg()
-            msg.header.frame_id = self.tf_drone
-            msg.temperature = self.tello.get_temperature()
-            msg.variance = 0.0
-            self.pub_temperature.publish(msg)
+            m = Temperature()
+            m.header.stamp = stamp
+            m.header.frame_id = self.tf_drone
+            m.temperature = 0.5 * (i('templ') + i('temph'))
+            m.variance = 0.0
+            self.pub_temperature.publish(m)
 
-        # Tello Status
         if self.pub_status.get_subscription_count() > 0:
-            msg = TelloStatus()
-            msg.acceleration.x = self.tello.get_acceleration_x()
-            msg.acceleration.y = self.tello.get_acceleration_y()
-            msg.acceleration.z = self.tello.get_acceleration_z()
+            m = TelloStatus()
+            m.header.stamp = stamp
+            m.header.frame_id = self.tf_drone
+            m.acceleration.x, m.acceleration.y, m.acceleration.z = [float(v) for v in accel_frd]
+            m.speed.x, m.speed.y, m.speed.z = [float(v) for v in vel_frd]
+            m.pitch, m.roll, m.yaw = int(pitch), int(roll), int(yaw)
+            try:
+                m.barometer = int(round(float(state.get('baro', 0.0)) * 100.0))
+            except (TypeError, ValueError):
+                m.barometer = 0
+            m.distance_tof = i('tof')
+            m.height = i('h')
+            m.fligth_time = i('time')
+            m.battery = max(0, min(255, i('bat')))
+            m.highest_temperature = i('temph')
+            m.lowest_temperature = i('templ')
+            m.temperature = 0.5 * (i('templ') + i('temph'))
+            m.wifi_snr = self._wifi_snr
+            self.pub_status.publish(m)
 
-            msg.speed.x = float(self.tello.get_speed_x())
-            msg.speed.y = float(self.tello.get_speed_y())
-            msg.speed.z = float(self.tello.get_speed_z())
-
-            msg.pitch = self.tello.get_pitch()
-            msg.roll = self.tello.get_roll()
-            msg.yaw = self.tello.get_yaw()
-
-            msg.barometer = int(self.tello.get_barometer())
-            msg.distance_tof = self.tello.get_distance_tof()
-            msg.fligth_time = self.tello.get_flight_time()
-            msg.battery = self.tello.get_battery()
-            msg.highest_temperature = self.tello.get_highest_temperature()
-            msg.lowest_temperature = self.tello.get_lowest_temperature()
-            msg.temperature = self.tello.get_temperature()
-            msg.wifi_snr = self.tello.query_wifi_signal_noise_ratio()
-
-            self.pub_status.publish(msg)
-
-        # Tello ID
-        if self.pub_id.get_subscription_count() > 0:
-            msg = TelloID()
-            msg.sdk_version = self.tello.query_sdk_version()
-            msg.serial_number = self.tello.query_serial_number()
-            self.pub_id.publish(msg)
-
-        # Camera info
+    def _on_slow_timer(self):
+        self._check_video_health()
+        if self.pub_id.get_subscription_count() > 0 and self._identity is not None:
+            m = TelloID()
+            m.sdk_version, m.serial_number = self._identity
+            self.pub_id.publish(m)
         if self.pub_camera_info.get_subscription_count() > 0:
             self.pub_camera_info.publish(self._camera_info_msg())
+        # One query every ~10 s, on the worker thread, and only if the queue is
+        # otherwise idle -- this is diagnostics, not something worth delaying a
+        # land command for.
+        if self.pub_status.get_subscription_count() > 0 and self._cmd_q.empty():
+            if int(time.time()) % 10 == 0:
+                self._cmd_q.put(('wifi_snr', ()))
 
+    # ------------------------------------------------------------------ #
+    # video
+    # ------------------------------------------------------------------ #
 
     def _on_video_timer(self):
-        if self.pub_image_raw.get_subscription_count() == 0:
+        if self.pub_image_raw.get_subscription_count() == 0 or self._frame_read is None:
             return
-
-        if self._frame_read is None:
-            return
-
         frame = self._frame_read.frame
         if frame is None:
             return
 
-        img = numpy.array(frame)
+        # Exact new-frame test: djitellopy hands out a fresh array object per
+        # decode, so `is` is True only when no new frame has arrived. Publishing
+        # an unchanged frame with a fresh timestamp fabricates motion-free
+        # evidence for the estimator and hides a dead decoder behind a
+        # healthy-looking topic.
+        if frame is self._prev_frame_obj:
+            self._duplicate_frames += 1
+            return
+        self._prev_frame_obj = frame
+
+        now = time.time()
+        self._last_new_frame_t = now
+
+        img = numpy.asarray(frame)
         if self.video_scale != 1.0:
-            img = self._resize_bgr(img, self.video_scale)
+            img = self._resize(img, self.video_scale)
 
-        msg = None
-        if self._bridge is not None:
-            try:
-                msg = self._bridge.cv2_to_imgmsg(img, encoding='bgr8')
-            except Exception:
-                msg = None
+        # djitellopy decodes to RGB (`np.array(frame.to_image())`), not BGR.
+        # Publishing it labelled 'bgr8' swaps red and blue for every consumer.
+        if self.publish_bgr:
+            img = img[:, :, ::-1] if img.ndim == 3 and img.shape[2] == 3 else img
+            encoding = 'bgr8'
+        else:
+            encoding = 'rgb8'
 
+        msg = self._to_imgmsg(img, encoding)
         if msg is None:
-            msg = self._bgr8_numpy_to_imgmsg(img)
-
-        msg.header.frame_id = self.tf_drone
+            return
+        msg.header.frame_id = self.camera_frame
         msg.header.stamp = self.node.get_clock().now().to_msg()
         self.pub_image_raw.publish(msg)
 
-        now = time.time()
         self._video_pub_count += 1
-        if self._video_pub_first_ts is None:
-            self._video_pub_first_ts = now
-            self.node.get_logger().info("Video: published first frame on /image_raw")
-        if now - self._video_pub_last_log_ts > 5.0 and self._video_pub_first_ts is not None:
-            dt = max(1e-6, now - self._video_pub_first_ts)
-            fps = float(self._video_pub_count) / dt
-            self.node.get_logger().info(f"Video: published {self._video_pub_count} frames, ~{fps:.1f} FPS")
-            self._video_pub_last_log_ts = now
+        self._video_win_count += 1
+        if self._video_win_start == 0.0:
+            self._video_win_start = now
+            self._video_last_log = now
+            self.node.get_logger().info('Video: first frame published on image_raw')
+            return
 
-    # Terminate the code and shutdown node.
-    def terminate(self, err):
-        self.node.get_logger().error(str(err))
-        self.tello.end()
-        rclpy.shutdown()
+        # Report the CURRENT rate over the last window. A cumulative average
+        # hides a stream that has degraded, and divides by ~0 on the first frame.
+        if now - self._video_last_log > 10.0:
+            win = max(1e-3, now - self._video_win_start)
+            self.node.get_logger().info(
+                f'Video: {self._video_win_count / win:.1f} FPS now '
+                f'({self._video_pub_count} total, {self._duplicate_frames} idle polls, '
+                f'{self._video_restarts} stream restarts)')
+            self._video_win_start = now
+            self._video_win_count = 0
+            self._video_last_log = now
 
-    def stop(self):
-        try:
-            self.tello.send_rc_control(0, 0, 0, 0)
-        except Exception:
-            pass
-        try:
-            self.tello.streamoff()
-        except Exception:
-            pass
-        try:
-            self.tello.end()
-        except Exception:
-            pass
+    def _check_video_health(self):
+        """Detect a dead decoder and ask the worker thread to restart the stream.
 
-    def _camera_info_msg(self) -> CameraInfo:
-        info = self.camera_info or {}
+        djitellopy's decode loop runs in its own thread and dies outright on
+        `av.error.OSError: [Errno 5]` when the UDP stream stalls -- which the
+        Tello does routinely on a congested link. Nothing in djitellopy notices:
+        `frame` keeps returning the last decoded image forever, so a naive
+        driver republishes a frozen picture indefinitely. Both signals are
+        checked because either can happen alone: the thread can die while a
+        recent frame is still cached, and the stream can stall for seconds
+        without the thread exiting.
+        """
+        if not self.video_auto_restart or self._frame_read is None:
+            return
+        if self._video_restart_pending:
+            return
 
-        msg = CameraInfo()
-        msg.header.stamp = self.node.get_clock().now().to_msg()
-        msg.header.frame_id = self.tf_drone
+        worker = getattr(self._frame_read, 'worker', None)
+        decoder_dead = worker is not None and not worker.is_alive()
+        stalled = (self._last_new_frame_t > 0.0
+                   and (time.time() - self._last_new_frame_t) > self.video_stall_timeout)
 
-        msg.width = int(info.get('image_width', 0))
-        msg.height = int(info.get('image_height', 0))
-        msg.distortion_model = str(info.get('distortion_model', 'plumb_bob'))
+        if decoder_dead or stalled:
+            why = 'decoder thread exited' if decoder_dead else \
+                f'no new frame for {self.video_stall_timeout:.0f}s'
+            self.node.get_logger().warn(f'Video stalled ({why}); restarting the stream')
+            self._video_restart_pending = True
+            self._cmd_q.put(('restart_video', ()))
 
-        d = info.get('distortion_coefficients', {}).get('data', [])
-        msg.d = [float(x) for x in d]
-
-        k = info.get('camera_matrix', {}).get('data', [])
-        if len(k) == 9:
-            msg.k = [float(x) for x in k]
-
-        r = info.get('rectification_matrix', {}).get('data', [])
-        if len(r) == 9:
-            msg.r = [float(x) for x in r]
-
-        p = info.get('projection_matrix', {}).get('data', [])
-        if len(p) == 12:
-            msg.p = [float(x) for x in p]
-
-        return msg
-
-    def _bgr8_numpy_to_imgmsg(self, img: "numpy.ndarray") -> Image:
-        # Ensure HxWx3 uint8 contiguous buffer
-        if img is None:
-            raise ValueError("Frame is None")
-        if img.dtype != numpy.uint8:
-            img = img.astype(numpy.uint8, copy=False)
+    def _to_imgmsg(self, img, encoding):
+        if self._bridge is not None:
+            try:
+                return self._bridge.cv2_to_imgmsg(numpy.ascontiguousarray(img),
+                                                  encoding=encoding)
+            except Exception:
+                pass
         if img.ndim != 3 or img.shape[2] != 3:
-            raise ValueError(f"Expected HxWx3 BGR image, got shape={getattr(img, 'shape', None)}")
+            return None
+        img = numpy.ascontiguousarray(img, dtype=numpy.uint8)
+        h, w, _ = img.shape
+        m = Image()
+        m.height, m.width = int(h), int(w)
+        m.encoding = encoding
+        m.is_bigendian = False
+        m.step = int(w * 3)
+        m.data = img.tobytes()
+        return m
 
-        img = numpy.ascontiguousarray(img)
-        height, width, _ = img.shape
+    def _resize(self, img, scale):
+        """Downscale with proper area averaging.
 
-        msg = Image()
-        msg.height = int(height)
-        msg.width = int(width)
-        msg.encoding = 'bgr8'
-        msg.is_bigendian = False
-        msg.step = int(width * 3)
-        msg.data = img.tobytes()
-        return msg
-
-    def _resize_bgr(self, img: "numpy.ndarray", scale: float) -> "numpy.ndarray":
-        # Fast nearest-neighbor downscale without OpenCV dependency.
-        # Good enough for low-latency preview/control.
-        if scale >= 1.0:
-            return img
-
-        # Common fast paths (no allocations, just stride-based subsampling)
-        if abs(scale - 0.5) < 1e-6:
-            return img[::2, ::2]
-        if abs(scale - 0.25) < 1e-6:
-            return img[::4, ::4]
+        INTER_AREA, not subsampling. Dropping every other pixel aliases
+        high-frequency detail into the low frequencies, which is precisely the
+        content a corner detector keys on -- an aliased half-resolution image
+        yields visibly worse and less repeatable features than a properly
+        filtered one. The stride path below exists only as a no-OpenCV fallback
+        and is documented as degraded.
+        """
+        if cv2 is not None:
+            return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
 
         h, w = int(img.shape[0]), int(img.shape[1])
         cache = self._resize_cache
         if cache is None or cache[0] != h or cache[1] != w or abs(cache[2] - scale) > 1e-9:
-            nh = max(1, int(h * scale))
-            nw = max(1, int(w * scale))
-            ys = (numpy.linspace(0, h - 1, nh)).astype(numpy.int32)
-            xs = (numpy.linspace(0, w - 1, nw)).astype(numpy.int32)
+            nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+            ys = numpy.linspace(0, h - 1, nh).astype(numpy.int32)
+            xs = numpy.linspace(0, w - 1, nw).astype(numpy.int32)
             self._resize_cache = (h, w, scale, ys, xs)
         else:
             ys, xs = cache[3], cache[4]
-
         return img[ys][:, xs]
 
-    # Stop all movement in the drone
+    def _camera_info_msg(self) -> CameraInfo:
+        """Build CameraInfo, **rescaled to the published image size**.
+
+        Downscaling the image without scaling the intrinsics is the single most
+        damaging silent bug available here: fx, fy, cx and cy are all in pixels,
+        so at video_scale=0.5 the unscaled matrix claims twice the focal length.
+        Every bearing computed from it is then wrong by a factor of two, which
+        SLAM absorbs as a scale error and never recovers from.
+
+        The pixel-centre convention matters at this precision: pixel *i* spans
+        [i, i+1) with centre i+0.5, so ``c' = (c + 0.5) s - 0.5``, not ``c s``.
+        Distortion coefficients are dimensionless (defined in normalised
+        coordinates) and must NOT be scaled.
+        """
+        if self._camera_info_cache is not None:
+            return self._camera_info_cache
+
+        info = self.camera_info_raw
+        s = self.video_scale
+        msg = CameraInfo()
+        msg.header.frame_id = self.camera_frame
+        w = int(info.get('image_width', 0))
+        h = int(info.get('image_height', 0))
+        msg.width = max(1, int(round(w * s))) if w else 0
+        msg.height = max(1, int(round(h * s))) if h else 0
+        msg.distortion_model = str(info.get('distortion_model', 'plumb_bob'))
+        msg.d = [float(x) for x in info.get('distortion_coefficients', {}).get('data', [])]
+
+        k = [float(x) for x in info.get('camera_matrix', {}).get('data', [])]
+        if len(k) == 9:
+            k = list(k)
+            k[0] *= s
+            k[4] *= s
+            k[2] = (k[2] + 0.5) * s - 0.5
+            k[5] = (k[5] + 0.5) * s - 0.5
+            msg.k = k
+
+        r = [float(x) for x in info.get('rectification_matrix', {}).get('data', [])]
+        if len(r) == 9:
+            msg.r = r
+
+        pr = [float(x) for x in info.get('projection_matrix', {}).get('data', [])]
+        if len(pr) == 12:
+            pr = list(pr)
+            pr[0] *= s
+            pr[5] *= s
+            pr[2] = (pr[2] + 0.5) * s - 0.5
+            pr[6] = (pr[6] + 0.5) * s - 0.5
+            pr[3] *= s
+            pr[7] *= s
+            msg.p = pr
+
+        self._camera_info_cache = msg
+        return msg
+
+    def _publish_static_camera_tf(self):
+        """Nominal base_link -> camera_optical. Overridden by tello_vio's calibrated one."""
+        t = TransformStamped()
+        t.header.stamp = self.node.get_clock().now().to_msg()
+        t.header.frame_id = self.tf_drone
+        t.child_frame_id = self.camera_frame
+        t.transform.translation.x = 0.03
+        t.transform.translation.y = 0.0
+        t.transform.translation.z = -0.01
+        # Rz(-90) Rx(-90): optical z forward, x right, y down, on an FLU body.
+        t.transform.rotation.x = -0.5
+        t.transform.rotation.y = 0.5
+        t.transform.rotation.z = -0.5
+        t.transform.rotation.w = 0.5
+        self._static_tf.sendTransform(t)
+
+    # ------------------------------------------------------------------ #
+    # control
+    # ------------------------------------------------------------------ #
+
     def cb_emergency(self, msg):
-        self.tello.emergency()
+        """Cut the motors immediately.
 
-    # Drone takeoff message control
+        Sent twice deliberately: once as a fire-and-forget datagram straight
+        from this callback so it cannot queue behind a stalled ``land()``, and
+        once through the worker so it is retried if the first packet is lost.
+        For a motor-cut command, a duplicate is harmless and a delay is not.
+        """
+        try:
+            self.tello.send_command_without_return('emergency')
+        except Exception:
+            pass
+        self._cmd_q.put(('emergency', ()))
+        self._rc = (0, 0, 0, 0)
+
     def cb_takeoff(self, msg):
-        try:
-            self.tello.takeoff()
-        except Exception as e:
-            self.node.get_logger().warn(f"Takeoff failed: {e}")
+        self._cmd_q.put(('takeoff', ()))
 
-    # Land the drone message callback
     def cb_land(self, msg):
-        try:
-            self.tello.land()
-        except Exception as e:
-            # Don't crash the node on failed land retries.
-            self.node.get_logger().warn(f"Land failed: {e}")
+        self._rc = (0, 0, 0, 0)
+        self._cmd_q.put(('land', ()))
 
-    # Control messages received use to control the drone "analogically"
-    #
-    # This method of controls allow for more precision in the drone control.
-    #
-    # Receives the linear and angular velocities to be applied from -100 to 100.
+    def cb_flip(self, msg):
+        self._cmd_q.put(('flip', (msg.data,)))
+
+    def cb_wifi_config(self, msg):
+        self._cmd_q.put(('wifi', (msg.ssid, msg.password)))
+
     def cb_control(self, msg):
-        lr = int(msg.linear.x)
-        fb = int(msg.linear.y)
-        ud = int(msg.linear.z)
-        yaw = int(msg.angular.z)
+        """Legacy stick-axis control: linear.x = lateral, linear.y = forward.
 
-        lr = max(-100, min(100, lr))
-        fb = max(-100, min(100, fb))
-        ud = max(-100, min(100, ud))
-        yaw = max(-100, min(100, yaw))
+        This mapping is NOT REP-103 (which puts forward on x) but it is the
+        convention ``tello_control``'s keyboard node has always published, and
+        silently changing it would invert an operator's controls mid-flight.
+        Use ``/cmd_vel`` for the standards-compliant interface.
+        """
+        self._set_rc(msg.linear.x, msg.linear.y, msg.linear.z, msg.angular.z)
 
-        self._rc = (lr, fb, ud, yaw)
+    def cb_cmd_vel(self, msg):
+        """REP-103 velocity command: +x forward, +y left, +z up, +yaw counter-clockwise.
+
+        Values are normalised stick units in [-1, 1] and scaled to the SDK's
+        [-100, 100]. The sign flips on y and yaw convert ROS FLU/counter-
+        clockwise into the Tello's right-positive/clockwise-positive channels.
+        """
+        self._set_rc(-msg.linear.y * 100.0, msg.linear.x * 100.0,
+                     msg.linear.z * 100.0, -msg.angular.z * 100.0)
+
+    def _set_rc(self, lr, fb, ud, yaw):
+        clamp = lambda v: max(-100, min(100, int(v)))
+        self._rc = (clamp(lr), clamp(fb), clamp(ud), clamp(yaw))
         self._rc_last_time = time.time()
 
-    # Configure the wifi credential that should be used by the drone.
-    #
-    # The drone will be restarted after the credentials are changed.
-    def cb_wifi_config(self, msg):
-        try:
-            self.tello.set_wifi_credentials(msg.ssid, msg.password)
-        except Exception as e:
-            self.node.get_logger().warn(f"WiFi config failed: {e}")
-    
-    # Perform a drone flip in a direction specified.
-    # 
-    # Directions can be "r" for right, "l" for left, "f" for forward or "b" for backward.
-    def cb_flip(self, msg):
-        try:
-            self.tello.flip(msg.data)
-        except Exception as e:
-            self.node.get_logger().warn(f"Flip failed: {e}")
-
     def _on_rc_timer(self):
-        now = time.time()
-        rc = self._rc
-        age = now - self._rc_last_time
+        """Send RC at a fixed rate, zeroing on a stale command (dead-man).
 
-        if age > self.rc_timeout_sec:
+        Two jobs at once: the Tello latches the last rc setpoint indefinitely,
+        so a lost publisher would leave the drone flying, and the SDK auto-lands
+        if it hears nothing for 15 s. A steady stream of (possibly zero) rc
+        packets solves both.
+        """
+        rc = self._rc
+        if time.time() - self._rc_last_time > self.rc_timeout_sec:
             rc = (0, 0, 0, 0)
             self._rc = rc
-
         try:
-            self.tello.send_rc_control(int(rc[0]), int(rc[1]), int(rc[2]), int(rc[3]))
+            self.tello.send_rc_control(*rc)
         except Exception:
             pass
 
-# Convert a rotation from euler to quaternion.
-def euler_to_quaternion(r):
-    (yaw, pitch, roll) = (r[0], r[1], r[2])
-    qx = math.sin(roll/2) * math.cos(pitch/2) * math.cos(yaw/2) - math.cos(roll/2) * math.sin(pitch/2) * math.sin(yaw/2)
-    qy = math.cos(roll/2) * math.sin(pitch/2) * math.cos(yaw/2) + math.sin(roll/2) * math.cos(pitch/2) * math.sin(yaw/2)
-    qz = math.cos(roll/2) * math.cos(pitch/2) * math.sin(yaw/2) - math.sin(roll/2) * math.sin(pitch/2) * math.cos(yaw/2)
-    qw = math.cos(roll/2) * math.cos(pitch/2) * math.cos(yaw/2) + math.sin(roll/2) * math.sin(pitch/2) * math.sin(yaw/2)
-    return [qx, qy, qz, qw]
+    # ------------------------------------------------------------------ #
 
-# Convert rotation from quaternion to euler.
-def quaternion_to_euler(q):
-    (x, y, z, w) = (q[0], q[1], q[2], q[3])
-    t0 = +2.0 * (w * x + y * z)
-    t1 = +1.0 - 2.0 * (x * x + y * y)
-    roll = math.atan2(t0, t1)
-    t2 = +2.0 * (w * y - z * x)
-    t2 = +1.0 if t2 > +1.0 else t2
-    t2 = -1.0 if t2 < -1.0 else t2
-    pitch = math.asin(t2)
-    t3 = +2.0 * (w * z + x * y)
-    t4 = +1.0 - 2.0 * (y * y + z * z)
-    yaw = math.atan2(t3, t4)
-    return [yaw, pitch, roll]
+    def stop(self):
+        self._shutdown.set()
+        for fn in (lambda: self.tello.send_rc_control(0, 0, 0, 0),
+                   lambda: self.tello.streamoff(),
+                   lambda: self.tello.end()):
+            try:
+                fn()
+            except Exception:
+                pass
+
 
 def main(args=None):
     rclpy.init(args=args)
-
     node = rclpy.create_node('tello')
-    drone = TelloNode(node)
-
+    drone = None
     try:
-        rclpy.spin(node)
+        drone = TelloNode(node)
+        # MultiThreadedExecutor is mandatory here: the callback groups above
+        # exist precisely so video, telemetry and the RC dead-man run
+        # concurrently. Under the default single-threaded executor they would
+        # serialise and the dead-man's timing guarantee would be lost.
+        executor = MultiThreadedExecutor(num_threads=4)
+        executor.add_node(node)
+        try:
+            executor.spin()
+        finally:
+            executor.shutdown()
     except KeyboardInterrupt:
         pass
+    except RuntimeError as e:
+        # Our own pre-flight diagnostics: the message IS the useful output, so
+        # do not bury it under a traceback the user has to read upwards.
+        for line in str(e).splitlines():
+            node.get_logger().error(line)
+        return
+    except Exception as e:
+        node.get_logger().error(f'Tello driver failed: {e}')
+        raise
     finally:
-        drone.stop()
+        if drone is not None:
+            drone.stop()
         try:
             node.destroy_node()
         except Exception:
             pass
-        try:
+        if rclpy.ok():
             rclpy.shutdown()
-        except Exception:
-            pass
+
 
 if __name__ == '__main__':
     main()

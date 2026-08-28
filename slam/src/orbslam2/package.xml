@@ -2,18 +2,36 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>orbslam2</name>
-  <version>0.0.1</version>
-  <description>Wrapper for the ORB SLAM2 library in ROS2.</description>
-  <maintainer email="tentone@outlook.com">tentone</maintainer>
+  <version>1.0.0</version>
+  <description>
+    ROS 2 wrapper for ORB-SLAM2 monocular. Publishes the camera pose as TF,
+    PoseStamped and Odometry in a ROS-convention map frame, plus the sparse map
+    as RViz markers. Intended as the loop-closing map backend behind tello_vio.
+  </description>
+  <maintainer email="roey.turgeman@aerosentry.tech">Roey Turgeman</maintainer>
   <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
   <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
   <depend>cv_bridge</depend>
   <depend>message_filters</depend>
+
+  <!--
+    ORB-SLAM2 itself is NOT a rosdep key: it is built out of tree by
+    scripts/orbslam.sh and located through ORB_SLAM2_ROOT_DIR. Eigen, OpenCV
+    and Boost are declared here so `rosdep install` actually provides what
+    CMake find_package()s.
+  -->
+  <depend>eigen</depend>
+  <depend>libopencv-dev</depend>
+  <depend>libboost-system-dev</depend>
 
   <export>
     <build_type>ament_cmake</build_type>

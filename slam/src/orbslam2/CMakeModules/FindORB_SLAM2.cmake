@@ -50,6 +50,15 @@ if(_ORB_SLAM2_ROOT)
 endif()
 if(_ORB_SLAM2_INCLUDE)
   list(APPEND ORB_SLAM2_INCLUDE_DIRS "${_ORB_SLAM2_INCLUDE}")
+  # NAMES above accepts either layout, but the wrapper sources include
+  # "System.h" flatly. For a fork that installs headers under
+  # include/ORB_SLAM2/, adding only the parent leaves those includes
+  # unresolvable: configure succeeds and the *compile* fails, which is a
+  # confusing place to discover a search-path problem. Add the nested
+  # directory too so both layouts actually work.
+  if(EXISTS "${_ORB_SLAM2_INCLUDE}/ORB_SLAM2/System.h")
+    list(APPEND ORB_SLAM2_INCLUDE_DIRS "${_ORB_SLAM2_INCLUDE}/ORB_SLAM2")
+  endif()
 endif()
 
 find_library(ORB_SLAM2_LIBRARIES

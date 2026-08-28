@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# colcon build artifacts.
+#
+# These were previously committed (build/, install/ and log/ held ~1000 files,
+# including absolute paths from whoever built last and --symlink-install
+# symlinks). That makes every build show up as a huge diff and makes the tree
+# unusable on another machine: a stale CMakeCache.txt pointing at a different
+# source directory aborts the build outright.
+# ---------------------------------------------------------------------------
+/build/
+/install/
+/log/
+workspace/build/
+workspace/install/
+workspace/log/
+slam/build/
+slam/install/
+slam/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Calibration output written into the working directory by the calib nodes
+imu_calibration.yaml
+camera_imu_calibration.yaml
+KeyFrameTrajectory.txt
+
+# Third-party sources fetched by scripts/orbslam.sh
+libs/ORB_SLAM2/
+libs/Pangolin/
+libs/g2o/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Recorded bags
+*.db3
+rosbag2_*/

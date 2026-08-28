@@ -1,230 +1,340 @@
-# Tello VIO (ROS 2 Humble, Ubuntu 22.04)
+# Tello VIO — Visual-Inertial Odometry on a DJI Tello (ROS 2 Humble)
 
-This is a **research project** aimed at implementing and studying **Visual-Inertial Odometry (VIO)** on a **DJI Tello** drone using **ROS 2 Humble on Ubuntu 22.04**.
+Metric, drift-bounded pose estimation on a stock DJI Tello, with no GPS and no
+motion capture. A KLT/two-view visual front-end feeds an error-state Kalman
+filter (real-time) and an optional fixed-lag factor-graph smoother (accuracy),
+fused with the drone's own attitude, optical-flow velocity, barometer and ToF.
+ORB-SLAM2 runs behind it as an optional loop-closing map backend.
 
-The project is **work in progress**: I am currently exploring how to integrate VIO on the Tello and how to implement this **pose estimation** approach as robustly as possible using the camera and IMU.
+> **Pipeline diagram (one page):** [`docs/Tello_VIO_Pipeline.pdf`](docs/Tello_VIO_Pipeline.pdf)
+> — every stage from UDP packet to published pose, with rates and algorithms.
+>
+> **Full technical report (32 pages):** [`docs/Tello_VIO_Technical_Report.pdf`](docs/Tello_VIO_Technical_Report.pdf)
+> — the algorithms, the derivations, the ROS 2 architecture and the measured results.
 
-In addition, this repo includes a ROS 2 driver for the Tello (based on [DJITelloPy](https://github.com/damiafuentes/DJITelloPy) and the official SDK: [Tello-Python](https://github.com/dji-sdk/Tello-Python)). Multi-drone control is also possible (swarm is supported on [Tello EDU](https://www.ryzerobotics.com/tello-edu)).
+---
 
-- It is recommended to update the Tello firmware to the latest version available.
-- The workspace is divided into sub-workspaces that contain different logic.
-  - `tello` package is the main package, includes access to the drone information, camera image and  control.
-  - `tello_msg` package defines custom messages to access specific Tello data.
-    - Defines the `TelloStatus`, `TelloID` and `TelloWifiConfig` messages 
-  - `tello_control` package is a sample control package that displays the drone image and provides keyboard control.
-    - Shows a live camera window and overlays battery + controls.
-    - Controls: `T` takeoff, `L` land, `E` emergency, `F` flip forward, arrows/WASD movement (`W/S` up/down, `A/D` yaw).
+## Start here: what a Tello can and cannot do
 
-- Bellow is the list of topics published and consumed by the `tello` package
-- The list of published topics alongside their description and frequency. These topics are only published when some node subscribed to them, otherwise they are not processed.
+This shapes every design decision in the repository, so it is stated before
+anything else.
 
-| Topic        | Type                           | Description                                                  | Frequency |
-| ------------ | ------------------------------ | ------------------------------------------------------------ | --------- |
-| /image_raw   | sensor_msgs/Image              | Image of the Tello camera                                    | 30hz      |
-| /camera_info | sensor_msgs/CameraInfo         | Camera information (size, calibration, etc)                  | 2hz       |
-| /status      | tello_msg/TelloStatus          | Status of the drone (wifi strength, batery, temperature, etc) | 2hz       |
-| /id          | tello_msg/TelloID              | Identification of the drone w/ serial number and firmware    | 2hz       |
-| /imu         | sensor_msgs/Imu                | Imu data capture from the drone                              | 10hz      |
-| /battery     | sensor_msgs/BatteryState       | Battery status                                               | 2hz       |
-| /temperature | sensor_msgs/Temperature        | Temperature of the drone                                     | 2hz       |
-| /odom        | nav_msgs/Odometry              | Odometry (only orientation and speed)                        | 10hz      |
-| /tf          | geometry_msgs/TransformStamped | Transform from base to drone tf, prefer a external publisher. | 10hz      |
+| | |
+|---|---|
+| **No gyroscope** | The SDK state broadcast carries *fused attitude* (whole degrees), not angular rate. Textbook tightly-coupled VIO — VINS-Mono, OpenVINS, ORB-SLAM3-VI — assumes 100–200 Hz gyro + accel. **That input does not exist on this aircraft.** |
+| **~10 Hz telemetry** | And jittery. A rate differentiated from whole-degree attitude at 10 Hz carries ~10 °/s of quantisation noise. |
+| **150–350 ms video latency** | H.264 over the drone's own WiFi AP, no hardware timestamps, jitter of tens of ms. |
+| **Metric velocity, for free** | The Tello runs its own downward optical-flow + ToF velocity estimator (`vgx/vgy/vgz`). This is the single most valuable signal on the drone: it is **metric**, which is exactly what a monocular camera cannot be. |
+| **Off-board compute** | Everything here runs on your laptop. The drone streams; it does not compute. "Efficient" means *fits in a 33 ms frame budget on one core*, not *fits on the drone*. |
 
-- The list of topics subscribed by the node, these topics can be renamed in the launch file.
+**The consequence:** this is a *loosely-coupled* estimator with an explicit
+metric-scale source, not a tightly-coupled one. Vision supplies rotation and
+translation **direction**; magnitude comes from the flow sensor, barometer and
+ToF. Pretending a monocular camera observes scale is how mono-VIO pipelines
+acquire a slowly-wrong scale that poisons everything downstream.
 
-| Topic        | Type                      | Description                                                  |
-| ------------ | ------------------------- | ------------------------------------------------------------ |
-| \emergency   | std_msgs/Empty            | When received the drone instantly shuts its motors off (even when flying), used for safety purposes |
-| \takeoff     | std_msgs/Empty            | Drone takeoff message, make sure that the drone has space to takeoff safely before usage. |
-| \land        | std_msgs/Empty            | Land the drone.                                              |
-| \control     | geometry_msgs/Twist       | Control the drone analogically. Linear values should range from -100 to 100, speed can be set in x, y, z for movement in 3D space. Angular rotation is performed in the z coordinate. Coordinates are relative to the drone position (x always relative to the direction of the drone) |
-| \flip        | std_msgs/String           | Do a flip with the drone in a direction specified. Possible directions can be "r" for right, "l" for left, "f" for forward or "b" for backward. |
-| \wifi_config | tello_msg/TelloWifiConfig | Configure the wifi credential that should be used by the drone. The drone will be restarted after the credentials are changed. |
+---
 
-- The list of parameters used to configure the node. These should be defined on a launch file.
+## Results
 
-| Name             | Type    | Description                                                  | Default        |
-| ---------------- | ------- | ------------------------------------------------------------ | -------------- |
-| connect_timeout  | float   | Time  (seconds) until the node is killed if connection to the drone is not available. | 10.0           |
-| tello_ip         | string  | IP of the tello drone. When using multiple drones multiple nodes with different IP can be launched. | '192.168.10.1' |
-| tf_base          | string  | Base tf to be used when publishing data                      | 'map'          |
-| tf_drone         | string  | Name of the drone tf to use when publishing data             | 'drone'        |
-| tf_pub           | boolean | If true a static TF from tf_base to tf_drone is published    | False          |
-| camera_info_file | string  | Path to a YAML camera calibration file (obtained with the calibration tool) | ''             |
-| video_backend    | string  | Video decoder backend. `pyav` is recommended; `opencv` is a good fallback; `djitellopy` uses the internal reader (more buffering). | 'pyav' |
-| video_scale      | float   | Downscale factor before publishing (reduces CPU + latency). | 1.0 |
-| video_target_fps | float   | Target publish rate. Frames are dropped to keep latency low. | 30.0 |
-| rc_rate_hz       | float   | Rate for sending RC commands to the drone. | 20.0 |
-| rc_timeout_sec   | float   | Deadman timeout: if no new control is received, RC is set to zero. | 0.35 |
+From `workspace/src/tello_vio/test/test_integration.py`, a simulated 60 s
+figure-of-eight with the real drone's limitations modelled (10 Hz jittery
+telemetry, 1° attitude quantisation, milli-g accelerometer, integer-decimetre
+velocity, drifting barometer, free-running yaw):
 
+| Metric | Result |
+|---|---|
+| Absolute trajectory error (RMS), 39.8 m flown | **0.57 m** |
+| Final position drift | **1.4 % of path length** |
+| Metric scale accuracy (path-length ratio) | **1.034** |
+| Roll/pitch RMS error | **1.8°** |
+| Position NEES (ideal 3.0) | **3.2** at 40 s, **3.8** at 60 s — mildly over-confident |
+| Accelerometer bias, estimated vs true | `[0.134 −0.098 0.055]` vs `[0.12 −0.08 0.05]` |
 
+**What the camera is actually worth**, averaged over 5 seeds:
 
-### Camera Calibration
+| Optical-flow quality | With vision | Without vision | Improvement |
+|---|---|---|---|
+| Healthy (σ = 0.08 m/s) | 0.364 m | 0.348 m | −5 % (neutral) |
+| Degraded (σ = 0.30 m/s) | 0.530 m | 0.666 m | **+20 %** |
+| Bad (σ = 0.80 m/s) | 0.779 m | 1.647 m | **+53 %** |
+| Flow sensor dead | 0.75 m | 15.1 m | **20× better** |
 
-- To allow the drone to be used for 3D vision tasks, as for example monocular SLAM the camera should be first calibrated.
-- A sample calibration file is provided with parameters captures from the drone used for testing but it is recommended to perform individual calibrations for each drone used.
-- Calibration can be achieved using the [camera_calibration](https://navigation.ros.org/tutorials/docs/camera_calibration.html) package. Calibration pattern can be generated using the [calib.io pattern generator](https://calib.io/pages/camera-calibration-pattern-generator) tool.
+Read that honestly: **when the Tello's flow sensor is working well over
+textured ground, monocular VO adds little to short-horizon odometry.** Its
+value is (a) redundancy — flow degrades above ~1 m altitude, over plain floors,
+in low light, over moving surfaces — and (b) global consistency through loop
+closure, via the ORB-SLAM2 backend. The repository does not overstate this.
+
+`116` unit and integration tests, all passing, none requiring a drone:
 
 ```bash
-ros2 run camera_calibration cameracalibrator --size 7x9 --square 0.16 image:=/image_raw camera:=/camera_info
+cd workspace/src/tello_vio && python3 -m pytest test/ -q
 ```
 
-- Take as many frame as possible and measure your check board grid size to ensure good accuracy in the process. When the process ends a `calibrationdata.tar.gz` will be created in the `/tmp` path.
+---
 
-
-
-### Launch File
-
-Launch files in ROS 2 are defined using Python. This repository ships a ready-to-use launch file:
+## Quick start
 
 ```bash
-source /opt/ros/humble/setup.bash
-colcon build --cmake-clean-cache
+# 1. Install (Ubuntu 22.04 + ROS 2 Humble)
+./scripts/install.sh
+
+# 2. Build
+./scripts/build.sh
+
+# 3. Connect to the Tello's WiFi AP (TELLO-XXXXXX), then:
 source install/setup.bash
-
-# Start driver + control GUI + RViz + TF publisher
-ros2 launch tello tello.launch.py
+ros2 launch tello_vio vio.launch.py rviz:=true
 ```
 
-You can tune video latency/CPU by changing the parameters:
+Before the numbers mean anything, calibrate — see **Calibration** below. Running
+uncalibrated produces a plausible-looking trajectory in the wrong units.
+
+---
+
+## Packages
+
+```
+workspace/src/
+  tello/          Driver: video, telemetry, control. Publishes SI units in ROS frames.
+  tello_msg/      TelloStatus / TelloID / TelloWifiConfig messages.
+  tello_control/  Keyboard control GUI with a live video window.
+  tello_vio/      The estimator. Pure NumPy/OpenCV core + ROS 2 nodes.
+slam/src/
+  orbslam2/       ORB-SLAM2 wrapper. Optional; publishes pose, TF and the map.
+```
+
+`tello_vio` is layered so everything except `nodes/` is testable and profilable
+without ROS installed:
+
+| Module | Contents |
+|---|---|
+| `lie.py` | SO(3)/SE(3) operations. **All conventions are declared here**, once. |
+| `tello_model.py` | What the drone actually measures: units, frames, the surrogate gyro. |
+| `preintegration.py` | On-manifold IMU preintegration (Forster et al., T-RO 2017). |
+| `eskf.py` | 22-state error-state KF with stochastic cloning. *Real-time path.* |
+| `smoother.py` | Fixed-lag factor graph with Schur-complement marginalisation. |
+| `two_view.py` | Essential/homography model selection, relative pose, triangulation. |
+| `frontend.py` | KLT tracking, keyframing, relative-pose measurements. |
+| `calib.py` | Allan-variance IMU identification, hand-eye extrinsic, time offset. |
+| `sim3.py` | Umeyama similarity alignment — `map ↔ odom`, monocular map scale. |
+
+---
+
+## Frames (REP-103 / REP-105)
+
+```
+map ──────────► odom ──────────► base_link ──────────► camera_optical
+     may jump         continuous          static, calibrated
+  (map_align)        (tello_vio)          (from camera_imu_calib)
+```
+
+* `odom → base_link` is **continuous**. Controllers differentiate it, so a jump
+  there is a step input to the aircraft. Published by `tello_vio`.
+* `map → odom` is **allowed to jump**. Nothing differentiates it. Published by
+  `map_align`, which aligns ORB-SLAM2's scale-free trajectory to the metric VIO
+  one; a loop closure lands here and the control loop never sees it.
+* `base_link` is FLU (x forward, y left, z up); `camera_optical` is the REP-103
+  optical frame (z out of the lens, x right, y down).
+
+**Exactly one node owns each TF edge.** Two publishers on one edge is a broken
+tree, not a redundant one.
+
+---
+
+## Calibration
+
+Three quantities must be measured per airframe. Skipping any of them gives you a
+confident wrong answer rather than an obviously wrong one.
+
+**1 — Camera intrinsics.** The shipped `ost.yaml` is from somebody else's drone,
+and its tangential distortion (`p1 = −0.023`) is large enough to suggest an
+under-constrained fit.
 
 ```bash
-# Lower latency / lower CPU (recommended starting point)
-ros2 launch tello tello.launch.py video_scale:=0.5 video_target_fps:=20
-
-# If PyAV has trouble decoding on your machine, try OpenCV backend
-ros2 launch tello tello.launch.py video_backend:=opencv video_scale:=0.5
+./scripts/cameracalib.sh          # SIZE=8x6 SQUARE=0.025 to override
 ```
 
+Fill the image corners, vary distance, and **tilt the board** — a target held
+flat and centred trades focal length against distance and yields a confident
+wrong `fx`.
 
-
-### Overheating Problems
-
-- The motor drivers in the DJI Tello overheat after a while when the drone is not flying. To cool down the drivers i have removed the plastic section on top of the heat spreader (as seen in the picture).
-- If you are comfortable with leaving the PCB exposed removing the plastic cover should result in even better thermals.
-- If possible place the drone on top of an old computer fan or use a laptop cooler to prevent the drone from shutting down due to overheating.
-
-### Install
-
-This repo is tested on **ROS 2 Humble** (Ubuntu 22.04).
-
-Install ROS dependencies:
+**2 — IMU noise and biases.** Drone still, motors off, on a surface that is not
+vibrating:
 
 ```bash
-sudo apt update
-rosdep update
-rosdep install -i --from-paths workspace/src slam/src --rosdistro humble -y
+ros2 launch tello_vio calibrate.launch.py target:=imu duration:=120.0
 ```
 
-Install Python dependencies (driver/video decode):
+Two minutes, not ten seconds: the Allan deviation only reveals the
+bias-instability and random-walk regions once the log is many times longer than
+the cluster times you care about.
+
+**3 — Camera-IMU rotation and time offset.** Pick the drone up (motors off) and
+rotate it smoothly about **all three axes** in front of a textured scene:
 
 ```bash
-python3 -m pip install --user djitellopy av
+ros2 launch tello_vio calibrate.launch.py target:=camera_imu duration:=90.0
 ```
 
-Build:
+Rotating about one axis leaves the extrinsic undetermined about that axis, so
+the node reports an **excitation score** alongside the residual. A small
+residual with a low excitation score means the fit is confidently wrong.
+
+Merge both YAML fragments into `workspace/src/tello_vio/config/tello_vio.yaml`.
+
+---
+
+## Topics
+
+**Driver** (`tello`) publishes:
+
+| Topic | Type | Notes |
+|---|---|---|
+| `/image_raw` | `sensor_msgs/Image` | ~30 Hz, `bgr8`, duplicate frames suppressed |
+| `/camera_info` | `sensor_msgs/CameraInfo` | **rescaled** when `video_scale != 1.0` |
+| `/imu` | `sensor_msgs/Imu` | SI, FLU. `angular_velocity_covariance[0] = -1` — there is no gyro |
+| `/odom` | `nav_msgs/Odometry` | Twist only; `pose.covariance[0] = -1` — no position source |
+| `/tof` | `sensor_msgs/Range` | `+inf` when out of the sensor's honest window |
+| `/status`, `/id`, `/battery`, `/temperature` | | `TelloStatus` now carries a `Header` |
+
+**Estimator** (`tello_vio`) publishes `~/odom`, `~/pose_predicted`, `~/path`,
+`~/debug_image`, `/diagnostics`, and the `odom → base_link` transform.
+`~/pose_predicted` is an *extrapolation* across the video latency for
+controllers — separate topic, inflated covariance, never confused with the
+fused estimate.
+
+**Control:** `/takeoff`, `/land`, `/emergency`, `/flip`, `/wifi_config`, and two
+velocity topics — `/control` (legacy stick axes: `linear.x` = lateral) and
+`/cmd_vel` (REP-103: `linear.x` = forward, normalised to ±1).
+
+---
+
+## Notable fixes in this revision
+
+An adversarial audit confirmed 30 defects in the original code. The ones that
+were reachable in flight:
+
+* **Blocking SDK calls in ROS callbacks.** `land()` retries for up to 21 s inside
+  its subscriber callback. On a single-threaded executor that froze
+  `/emergency` *and* the RC dead-man for the whole window, leaving a drone
+  commanded forward flying forward. All blocking commands now run on a worker
+  thread; `/emergency` bypasses the queue.
+* **`/imu` published a fabricated zero angular velocity with zero covariance** —
+  ROS semantics for "measured, and exactly known". Any consumer would believe it.
+* **IMU in the drone's FRD frame with a 2 % scale error** — `z ≈ −10 m/s²` at
+  rest instead of `+9.81`.
+* **Attitude published without the NED→ENU conversion** — yaw and pitch ran
+  backwards.
+* **`camera_info` was not rescaled with `video_scale`** — at `0.5` it claimed
+  twice the true focal length, which SLAM absorbs as an unrecoverable scale error.
+* **`AttributeError` on most `video_scale` values** — `_resize_cache` was read
+  but never initialised.
+* **The ORB-SLAM2 wrapper computed a pose every frame and discarded it** — no TF,
+  no odometry. It now publishes pose, TF, path and tracking state, with the
+  optical→ROS rotation applied.
+* **`ORB_SLAM2_ENABLE=OFF` forced the build instead of skipping it.**
+* **`scripts/build.sh` did `cd ../workspace && rm -rf build install log`** — a
+  relative path plus a recursive delete.
+
+Full detail, with failure scenarios, is in the technical report.
+
+---
+
+## Optional: ORB-SLAM2 backend
 
 ```bash
-colcon build --cmake-clean-cache
+./scripts/orbslam.sh                       # builds into libs/ORB_SLAM2
+export ORB_SLAM2_ROOT_DIR="$PWD/libs/ORB_SLAM2"
+./scripts/build.sh
+
+ros2 launch tello_vio vio.launch.py slam:=true \
+    vocabulary:=$PWD/libs/ORB_SLAM2/Vocabulary/ORBvoc.txt \
+    slam_config:=$(ros2 pkg prefix orbslam2)/share/orbslam2/config.yaml
 ```
 
+Without `ORB_SLAM2_ROOT_DIR` the package configures, warns, and skips its node,
+so the rest of the workspace still builds. **The settings file must match the
+resolution actually being published** — ORB-SLAM2 reads that YAML, not
+`/camera_info`, so nothing will warn you if `video_scale` disagrees with it.
 
+---
 
-### Visual SLAM
+## Troubleshooting
 
-- The drone is equipped with a IMU and a camera that can be used for visual SLAM in order to obtain the location of the drone and a map of the environment.
-- [ORB SLAM 2](https://github.com/raulmur/ORB_SLAM2) is a monocular visual based algorithm for SLAM that can be easily integrated with the Tello drone using this package.
-- The wrapper provided alongside with this repository is based on the [alsora/ros2-ORB-SLAM2](https://github.com/alsora/ros2-ORB_SLAM2/tree/f890df18983ead8cd2ae36676036d535ee52951b) project using the [alsora/ORB_SLAM2](alsora/ORB_SLAM2) modified version of ORB Slam that does not depend on pangolin.
-- The `orbslam2` package is **optional**: it will build even if ORB-SLAM2 is not installed (it will skip building the `mono` executable and print a CMake warning).
-
-To enable it, build/install ORB-SLAM2 separately and set `ORB_SLAM2_ROOT_DIR` to the ORB-SLAM2 directory (must contain `include/ORB_SLAM2/System.h` and `lib*/libORB_SLAM2.*`).
-
-To run the monocular SLAM node after installing all dependencies and building the package run:
+**`ros2 topic list` / `rqt` hangs forever (WSL2).** The `ros2` daemon fails to
+start under WSL2; DDS itself is fine. Every introspection command works with the
+daemon bypassed:
 
 ```bash
-ros2 run orbslam2 mono <VOCABULARY FILE> <CONFIG_FILE>
+ros2 topic list --no-daemon
 ```
 
-- The vocabulary file can be obtained from the ORB_SLAM2 repository ( `ORB_SLAM2/Vocabulary/ORBvoc.txt`).
-- Sample configuration files can be found inside the package at `orbslam2/src/monocular/config.yaml` for monocular SLAM.
+Launching nodes is unaffected — only the CLI introspection tools use the daemon.
 
-### Theoretical references (to be added)
-
-This section is reserved for theoretical references on VIO/SLAM/state estimation that will be added later. For now it acts as a placeholder:
-
-- **VIO / Visual-Inertial Navigation**: TBD
-- **State Estimation / Filtering (EKF/MSCKF)**: TBD
-- **Optimization / Factor Graphs (Bundle Adjustment, Smoothing)**: TBD
-- **IMU Preintegration**: TBD
-- **Camera Models & Calibration**: TBD
-- **ROS 2 + VIO integration notes**: TBD
-
-
-
-### Setup ROS 2 Humble
-
-- Run the install script to setup the ROS 2 (Humble Hawksbill) environment. 
-- Check the [ROS2 Tutorials](https://index.ros.org/doc/ros2/Tutorials/) page to learn how to setup workspace and create packages.
-
-##### Workspace
-
-- To install dependencies of the packages available in a workspace directory `src` run `rosdep install -i --from-paths src --rosdistro humble -y`
-- To build workspace you can use the command `colcon build`,  some useful arguments for `colcon build`:
-
-  - `--packages-up-to` builds the package you want, plus all its dependencies, but not the whole workspace (saves time)
-  - `--symlink-install` saves you from having to rebuild every time you tweak python scripts
-  - `--event-handlers console_direct+` shows console output while building (can otherwise be found in the `log` directory)
-
-##### Packages
-
-- To create a new ROS2 package (C++ or Python) for development move to the `src` package and run
+**`AttributeError: _ARRAY_API not found` or `KeyError: 16` from `cv_bridge`.**
+ROS 2 Humble's compiled Python extensions are built against numpy 1.x and
+OpenCV 4.x. A newer numpy or OpenCV in `~/.local` shadows them and breaks
+`cv_bridge` — which also breaks `camera_calibration`. Pin them back:
 
 ```bash
-# CPP Package
-ros2 pkg create --build-type ament_cmake --node-name <node_name> <package_name>
-
-# Python Package
-ros2 pkg create --build-type ament_python --node-name <node_name> <package_name>
+python3 -m pip install --user "numpy<2" "opencv-python<5"
 ```
 
-##### Tools
+`tello_vio` itself runs on either stack (the test suite passes on both); only
+ROS's own extensions are version-sensitive. The driver and VIO node degrade
+gracefully without `cv_bridge`, but you lose debug images and calibration.
 
-- `rqt_topic` Used to monitor topics and their values in a list
-- `rqt_graph` Draw the graph of connection between the currently active nodes and explore communication between them
-- `rviz` Visualize topics in 3D space.
-
-##### Bags
-
-- Bags can be used to record data from topics that can be later replayed for off-line testing. Bags can be manipulated using the `ros2 bag` command. To 
+**`CMake Error: ... CMakeCache.txt directory is different`.** A stale `build/`
+tree from another path. Wipe it:
 
 ```bash
-# Record a bag containing data from some topics into a file
-ros2 bag record -o <bag_file_name> /turtle1/cmd_vel /turtle1/pose ...
-
-# Check the content of a bag run the command
-ros2 bag info <bag_file_name>
-
-# Replay the content of some topics recorded into a bag file
- ros2 bag play <bag_file_name>
+CLEAN=1 ./scripts/build.sh
 ```
 
-- To play ROS 1 bags in ROS 2 you will need to first install ROS 1, and the ROS bag adapter plugin. The the bags can be run using the command.
+**`OSError: [Errno 98] Address already in use` on startup.** Not a connectivity
+problem. A previous driver is still holding UDP :8889 — it outlived its launch,
+which happens when the video decoder thread dies and the node keeps spinning.
+Find and stop it:
 
 ```bash
-ros2 bag play -s rosbag_v2 <path_to_bagfile>
+ss -lunp | grep -E '8889|8890|11111'
 ```
 
-##### Camera calibration
+```bash
+pkill -f 'lib/tello/tello'
+```
 
-- Calibration files provided were obtained using our test drone.
-- To get your own calibration file use the [ROS camera calibration tool]()
+The driver now detects this case and prints those instructions instead of a
+traceback.
 
+**The drone stops responding after ~15 s.** The Tello auto-lands if it hears no
+command for 15 s. The driver sends RC at 20 Hz precisely to prevent this — check
+the driver node is actually running and that `/status` is updating.
 
+## Known limitations
 
-### Ubuntu 22.04 notes
+* **Yaw is unbounded.** No magnetometer, so heading free-runs (~13° RMS over
+  60 s in simulation). Bounding it needs loop closure or an external reference.
+* **Monocular scale depends on the flow sensor.** Above ~1–2 m, or over a
+  featureless floor, the metric anchor weakens — the table above quantifies it.
+* **Preintegration is fed a 10 Hz surrogate rate**, not a gyro. The mathematics
+  is rate-agnostic and would run unchanged on a real IMU; the *information* it
+  carries here is proportionally weaker.
+* **No relocalisation in the fast path.** KLT has no descriptors. Recovering
+  from total tracking loss is ORB-SLAM2's job.
+* **Simulation is not flight.** The results above come from a simulator built
+  from the SDK's documented behaviour. Validate on a recorded bag before
+  trusting any number.
 
-- This repository targets **Ubuntu 22.04 (jammy)** + **ROS 2 Humble**.
-- If any dependency scripts rely on `lsb_release -cs`, it should return `jammy` on Ubuntu 22.04.
+## Overheating
 
+The Tello's motor drivers overheat when it sits powered on but not flying —
+exactly what calibration involves. Point a fan at it, or expect the two-minute
+IMU log to end in a thermal shutdown.
 
+## Licence
 
+MIT. ORB-SLAM2 is GPLv3 and is *not* vendored here; `scripts/orbslam.sh` fetches
+it separately.

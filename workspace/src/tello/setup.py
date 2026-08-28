@@ -22,7 +22,6 @@ setup(
     maintainer_email='tentone@outlook.com',
     description='DJI Tello control package for ROS 2',
     license='MIT',
-    tests_require=[],
     entry_points={
         'console_scripts': [
             'tello = tello.node:main'

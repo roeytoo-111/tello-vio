@@ -1,4 +1,0 @@
-PyYAML
-djitellopy
-numpy
-setuptools

@@ -18,13 +18,17 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
-  <exec_depend>rosidl_default_runtime</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
 
-  <build_depend>rosidl_default_generators</build_depend>
-
+  <!--
+    This package defines no messages. It previously declared
+    rosidl_default_generators and joined rosidl_interface_packages, which tells
+    the build system to run the IDL generator over a package with no .msg
+    files: pure overhead, and misleading to anyone reading the manifest.
+    The messages live in tello_msg, which is depended on below.
+  -->
   <depend>tello_msg</depend>
-
-  <member_of_group>rosidl_interface_packages</member_of_group>
 
   <export>
     <build_type>ament_python</build_type>

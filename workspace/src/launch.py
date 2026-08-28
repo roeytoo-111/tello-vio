@@ -1,99 +1,40 @@
+"""Deprecated top-level launch file, kept working for muscle memory.
+
+Prefer one of the installed launch files, which are discoverable and take
+arguments:
+
+    ros2 launch tello_vio vio.launch.py      # driver + VIO (what you want)
+    ros2 launch tello tello.launch.py        # driver + keyboard control only
+
+This file remains because `ros2 launch launch.py` from `workspace/src` is in
+the README's history. Two things it used to get wrong are fixed here:
+
+* it remapped the driver's `/image_raw` to `/camera`, while `tello_control`,
+  the ORB-SLAM2 wrapper and every ROS image tool subscribe to `/image_raw` --
+  so the camera window stayed black and SLAM never received a frame;
+* it started a `map -> drone` static transform that collided with the driver's
+  own transform on the same edge.
+"""
+
 from launch import LaunchDescription
 from launch_ros.actions import Node
-from ament_index_python.packages import get_package_share_directory
+
 
 def generate_launch_description():
-    rviz_config = get_package_share_directory('tello_control') + '/rviz.rviz'
-    nodes = [
-        # Tello driver node
+    return LaunchDescription([
         Node(
-            package='tello',
-            executable='tello',
-            output='screen',
-            namespace='/',
-            name='tello',
-            parameters=[
-                {'connect_timeout': 10.0},
-                {'tello_ip': '192.168.10.1'},
-                {'tf_base': 'map'},
-                {'tf_drone': 'drone'}
-            ],
-            remappings=[
-                ('/image_raw', '/camera')
-            ],
-            respawn=True
+            package='tello', executable='tello', name='tello', output='screen',
+            parameters=[{
+                'tello_ip': '192.168.10.1',
+                'tf_base': 'odom',
+                'tf_drone': 'base_link',
+                'camera_frame': 'camera_optical',
+                'tf_pub': True,
+            }],
+            respawn=False,
         ),
-
-        # Tello control node
         Node(
-            package='tello_control',
-            executable='tello_control',
-            namespace='/',
-            name='control',
-            output='screen',
-            respawn=False
+            package='tello_control', executable='tello_control', name='control',
+            output='screen', respawn=False,
         ),
-
-        # RQT topic debug tool
-        Node(
-            package='rqt_gui',
-            executable='rqt_gui',
-            output='screen',
-            namespace='/',
-            name='rqt',
-            respawn=False
-        ),
-
-        # RViz data visualization tool
-        Node(
-            package='rviz2',
-            executable='rviz2',
-            output='screen',
-            namespace='/',
-            name='rviz2',
-            respawn=True,
-            arguments=['-d', rviz_config]
-        ),
-
-        # Static TF publisher
-        Node(
-            package='tf2_ros',
-            executable='static_transform_publisher',
-            namespace='/',
-            name='tf',
-            arguments=['0', '0', '0', '0', '0', '0', '1', 'map', 'drone'],
-            respawn=True
-        ),
-
-        # ORB SLAM
-        # Node(
-        #     package='orbslam2',
-        #     executable='mono',
-        #     output='screen',
-        #     namespace='/',
-        #     name='orbslam',
-        #     respawn=True,
-        #     remappings=[
-        #         ('/camera', '/image_raw')
-        #     ],
-        #     arguments=['~/Git/tello-slam/libs/ORB_SLAM2/Vocabulary/ORBvoc.txt', '~/Git/tello-slam/workspace/src/orbslam2/config.yaml']
-        # ),
-
-        # Camera calibration node
-        # Node(
-        #     package='camera_calibration',
-        #     executable='cameracalibrator',
-        #     output='screen',
-        #     respawn=True,
-        #     namespace='/',
-        #     name='calibration',
-        #     arguments=['--size', '7x9', '--square', '0.20'],
-        #     parameters=[
-        #         {'image': '/image_raw'},
-        #         {'camera': '/camera_info'}
-        #     ]
-        # )
-    ]
-
-
-    return LaunchDescription(nodes)
+    ])

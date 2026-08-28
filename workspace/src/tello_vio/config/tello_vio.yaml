@@ -1,0 +1,93 @@
+# tello_vio configuration.
+#
+# Values marked CALIBRATE are placeholders that MUST be replaced with results
+# from your own drone before the metric output means anything:
+#
+#   ros2 run tello_vio imu_calib          -> accel/gyro noise densities
+#   ros2 run tello_vio camera_imu_calib   -> extrinsic_rpy_deg, time_offset_s
+#   ros2 run camera_calibration ...       -> camera intrinsics (see README)
+
+/tello_vio:
+  ros__parameters:
+
+    # ---- topics -----------------------------------------------------------
+    image_topic: /image_raw
+    camera_info_topic: /camera_info
+    imu_topic: /imu
+    status_topic: /status
+    tof_topic: /tof
+
+    # ---- frames (REP-105) -------------------------------------------------
+    # map -> odom  is published by tello_vio/map_align (drift correction, may jump)
+    # odom -> base_link is published here (continuous, drifts slowly)
+    # base_link -> camera_optical is a static transform from the extrinsic below
+    odom_frame: odom
+    body_frame: base_link
+    camera_frame: camera_optical
+    publish_tf: true
+
+    # ---- camera-IMU extrinsic --------------------------------------------
+    # Nominal R_BC is the standard forward-facing optical mount. These are the
+    # *corrections* to it, in degrees (roll, pitch, yaw).       CALIBRATE
+    extrinsic_rpy_deg: [0.0, 0.0, 0.0]
+    camera_tilt_deg: 0.0
+    # Camera position in the body frame, metres. Take this from the mechanical
+    # layout: it is a few centimetres and is not well observable from motion.
+    extrinsic_xyz_m: [0.03, 0.0, -0.01]
+
+    # ---- timing -----------------------------------------------------------
+    # Seconds subtracted from each image header stamp to recover capture time.
+    # Tello video typically lands 0.15-0.35 s late over its own WiFi AP.
+    time_offset_s: 0.0                                        # CALIBRATE
+
+    # ---- sensor scaling ---------------------------------------------------
+    # vgx/vgy/vgz -> m/s. 0.1 assumes decimetres per second; see
+    # tello_vio/tello_model.py for why this is a parameter and not a constant.
+    speed_to_mps: 0.1
+
+    use_body_velocity: true
+    use_barometer: true
+    use_tof: true
+    use_attitude: true
+    use_zupt: true
+
+    # ---- noise model ------------------------------------------------------
+    accel_noise_density: 0.08     # m/s^2/sqrt(Hz)             CALIBRATE
+    gyro_noise_density: 0.03      # rad/s/sqrt(Hz)             CALIBRATE
+    accel_bias_rw: 0.001
+    gyro_bias_rw: 0.0001
+    att_rp_std_deg: 2.0           # gravity-referenced: absolute
+    att_yaw_std_deg: 15.0         # no magnetometer: yaw free-runs
+    vel_body_std: 0.15
+    baro_std: 0.30
+    tof_std: 0.03
+
+    # ---- visual front-end -------------------------------------------------
+    vo_enable: true
+    vo_work_width: 480            # downscale before tracking; 4x cheaper than 960
+    vo_max_features: 180
+    vo_min_features: 90
+    vo_kf_parallax_px: 12.0       # rotation-compensated when a prior is available
+    vo_ransac_px: 1.5
+    vo_base_rot_std: 0.033        # rad; fitted, see frontend.noise_std
+    vo_base_dir_std: 0.128        # rad
+
+    # ---- output -----------------------------------------------------------
+    publish_debug_image: true
+    publish_path: true
+    path_max_poses: 2000
+    telemetry_buffer_s: 3.0
+    diagnostics_hz: 2.0
+
+/tello_map_align:
+  ros__parameters:
+    slam_pose_topic: /orbslam/pose
+    vio_odom_topic: /tello_vio/odom
+    map_frame: map
+    odom_frame: odom
+    window_s: 20.0
+    min_pairs: 25
+    min_span_m: 0.5
+    update_hz: 2.0
+    ransac_threshold_m: 0.2
+    fixed_scale: 0.0

@@ -38,6 +38,8 @@
 #define KEY_ENTER 13
 #define KEY_SPACE 32
 
+#define WINDOW "Tello"
+
 using namespace std::chrono_literals;
 
 class TelloControl : public rclcpp::Node
@@ -106,11 +108,6 @@ class TelloControl : public rclcpp::Node
 		double battery_percentage = -1.0;
 
 		/**
-		 * Timestamp of last battery message.
-		 */
-		rclcpp::Time battery_stamp = rclcpp::Time(0, 0, RCL_SYSTEM_TIME);
-
-		/**
 		 * Construct a new Tello Control object
 		 */
 		TelloControl() : Node("control")
@@ -131,7 +128,15 @@ class TelloControl : public rclcpp::Node
 				10,
 				std::bind(&TelloControl::batteryCallback, this, std::placeholders::_1));
 
-			timer = this->create_wall_timer(1ms, std::bind(&TelloControl::timerCallback, this));
+			// One window, created once. Calling namedWindow inside the timer
+			// re-creates the window handle every tick on some HighGUI backends.
+			cv::namedWindow(WINDOW, cv::WINDOW_AUTOSIZE);
+
+			// 33 ms, not 1 ms. The previous 1 ms timer immediately blocked for
+			// 15 ms inside cv::waitKey, so the node actually ran at ~66 Hz while
+			// spinning a core to render a 30 Hz video stream twice over. The
+			// timer sets the rate; waitKey(1) only pumps the GUI event loop.
+			timer = this->create_wall_timer(33ms, std::bind(&TelloControl::timerCallback, this));
 		}
 
 		void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
@@ -153,7 +158,6 @@ class TelloControl : public rclcpp::Node
 		void batteryCallback(const sensor_msgs::msg::BatteryState::SharedPtr msg)
 		{
 			battery_percentage = msg->percentage;
-			battery_stamp = msg->header.stamp;
 		}
 
 		/**
@@ -163,7 +167,10 @@ class TelloControl : public rclcpp::Node
 		 */
 		void manualControl(int key)
 		{
-			// Speed of the drone in manual control mode.
+			// Stick deflection in SDK units. NOTE the axis convention on the
+			// `control` topic is x = lateral, y = forward -- NOT REP-103. It is
+			// kept because changing it would invert an operator's controls. The
+			// driver also exposes a REP-103-compliant `cmd_vel` topic.
 			double manual_speed = 50;
 
 			geometry_msgs::msg::Twist msg = geometry_msgs::msg::Twist();
@@ -182,7 +189,6 @@ class TelloControl : public rclcpp::Node
 
 		void timerCallback()
 		{
-			cv::namedWindow("Tello", cv::WINDOW_AUTOSIZE);
 			cv::Mat to_show;
 			if (has_frame)
 			{
@@ -211,12 +217,16 @@ class TelloControl : public rclcpp::Node
 			cv::putText(to_show, "Arrows/WASD: move  (W/S up-down, A/D yaw)", cv::Point(10, 75),
 				cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255, 255, 255), 1);
 
-			cv::imshow("Tello", to_show);
+			cv::imshow(WINDOW, to_show);
 
-			int key = cv::waitKey(15);
-			
+			// waitKey(1) pumps the GUI event queue without blocking the
+			// executor; the timer period is what sets the display rate.
+			// The mask strips the modifier bits some backends set in the high
+			// bytes, which otherwise make every keypress compare unequal.
+			int key = cv::waitKey(1);
 			if (key != NO_KEY)
 			{
+				key &= 0xFF;
 				// Takeoff
 				if(key == (int)('t'))
 				{

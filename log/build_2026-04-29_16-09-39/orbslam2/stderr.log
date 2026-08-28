@@ -1,5 +1,0 @@
-[33mCMake Warning at CMakeLists.txt:33 (message):
-  ORB_SLAM2 not found; skipping orbslam2 node build.  Set ORB_SLAM2_ROOT_DIR
-  (or install ORB_SLAM2) and rebuild to enable.
-
-[0m
