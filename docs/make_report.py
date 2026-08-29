@@ -273,9 +273,11 @@ def build_toc():
         ("8", "Fusion II — the fixed-lag smoother", "Factor graphs and why marginalisation is not optional"),
         ("9", "Calibration", "Three quantities you must measure yourself"),
         ("10", "ROS 2 concepts, as used here", "Executors, QoS, TF, and the decisions they force"),
-        ("11", "Results", "Measured performance, and what the camera is actually worth"),
-        ("12", "Bring-up procedure", "The order to do things in"),
-        ("13", "Limitations and next steps", "What this does not do"),
+        ("11", "The pipeline end to end", "One image and one telemetry packet, followed all the way through"),
+        ("12", "What went wrong in flight", "Three hypotheses, two refuted, one root cause"),
+        ("13", "Results", "Measured performance, and what the camera is actually worth"),
+        ("14", "Bring-up procedure", "The order to do things in"),
+        ("15", "Limitations and next steps", "What this does not do"),
         ("A", "Reference", "Files, parameters, topics"),
     ]
     rows = []
@@ -363,7 +365,7 @@ def sec1():
     st += figure("results.png",
                  "Figure 1 — 60&nbsp;s simulated flight with the real drone's limitations "
                  "modelled: 10&nbsp;Hz jittery telemetry, whole-degree attitude, milli-g "
-                 "accelerometer quantisation, integer-decimetre velocity, a drifting barometer "
+                 "accelerometer quantisation, integer-centimetre velocity, a drifting barometer "
                  "and a free-running yaw. Left: trajectory. Centre: position error. Right: "
                  "covariance calibration.")
     st.append(PageBreak())
@@ -389,16 +391,24 @@ def sec2():
         "runs on the ground station</b>. “Computationally efficient” therefore means <i>fits "
         "inside a 33&nbsp;ms frame budget on one laptop core</i>, not <i>fits on the drone</i>."))
     st += table([
-        ["Port", "Contents", "Rate", "What it costs you"],
-        ["11111", "H.264 video, 960×720", "~30 fps nominal", "150–350 ms latency, jittery, "
+        ["Port", "Contents", "Rate (measured)", "What it costs you"],
+        ["11111", "H.264 video, 960×720", "<b>27.6 Hz</b> median<br/>(17.0 – 30.1)",
+         "150–350 ms latency, jittery, "
          "no hardware timestamp, visible compression artefacts"],
         ["8890", "State broadcast: attitude, accelerations, velocities, "
-         "barometer, ToF, height, battery, temperatures", "~10 Hz, aperiodic",
+         "barometer, ToF, height, battery, temperatures", "<b>9.99 Hz</b> median<br/>(9.49 – 10.53)",
          "whole-degree attitude; milli-g accelerations; velocity in integer units; "
          "<b>no angular rate</b>"],
         ["8889", "Commands and responses", "on demand",
          "every command is a blocking round trip with a 7&nbsp;s timeout and 3 retries"],
     ], widths=[14 * mm, 56 * mm, 24 * mm, 70 * mm])
+
+    st.append(Paragraph(
+        "Rates are medians over a 70-second flight log, computed from the estimator's own "
+        "message counters — not quoted from the datasheet. The documented figures (30 fps, "
+        "10 Hz) are close for telemetry and optimistic for video. <b>2.8 images arrive per "
+        "telemetry packet</b>, and Section&nbsp;11.4 shows how that ratio produced a real "
+        "scheduling defect.", CAP))
 
     st.append(Paragraph("2.2  There is no gyroscope", H2))
     st.append(para(
@@ -443,8 +453,9 @@ def sec2():
          "× 9.80665/1000, then FRD→FLU",
          "dividing by 100 gives 10.0 at rest — <i>looks</i> like 9.81 and is 2 % high"],
         ["vgx/vgy/vgz", "velocity from the onboard optical flow",
-         "× 0.1 (decimetres/s), FRD→FLU",
-         "the SDK documents no unit; this is a <b>parameter</b>, not a constant"],
+         "<b>× 0.01 (centimetres/s)</b>, FRD→FLU",
+         "the SDK documents no unit here, though it says cm/s for every other speed. "
+         "Assuming decimetres cost a 10× runaway in flight — Section&nbsp;12"],
         ["baro", "pressure altitude in metres",
          "relative use only, with an estimated bias",
          "referenced to sea level, not to takeoff; it drifts with weather"],
@@ -453,6 +464,13 @@ def sec2():
         ["pitch/roll/yaw", "degrees, NED-referenced", "roll, −pitch, −yaw",
          "yaw has no absolute reference — no usable magnetometer"],
     ], widths=[22 * mm, 42 * mm, 44 * mm, 56 * mm])
+    st.append(Paragraph(
+        "Every one of these is a <b>parameter</b> rather than a hard-coded constant, because "
+        "the SDK documentation is thin and firmware-dependent. That was the right structure "
+        "and it was still not enough: <font face='Courier'>speed_to_mps</font> shipped at the "
+        "wrong value, and because it sets the estimator's metric scale — the one quantity "
+        "vision structurally cannot check — nothing detected it until the aircraft flew. "
+        "Documenting an assumption is not the same as verifying it.", CAP))
     st.append(para(
         "A level Tello at rest reports <font face='Courier'>agz ≈ −1000</font>. An "
         "accelerometer measures specific force <i>f</i>&nbsp;=&nbsp;<i>a</i>&nbsp;−&nbsp;<i>g</i>; "
@@ -1354,15 +1372,366 @@ def sec10():
 
 
 # --------------------------------------------------------------------------- #
+# 11. The pipeline end to end
+# --------------------------------------------------------------------------- #
+
+def sec_pipeline():
+    st = h1("11", "The pipeline end to end",
+            "One image and one telemetry packet, followed all the way through")
+
+    st.append(para(
+        "Everything before this section described components. This one follows real data "
+        "through them in order, naming the function that touches it at each step and the "
+        "reason that step exists. Every rate quoted here was <b>measured on the aircraft</b>, "
+        "not taken from a datasheet: see Section&nbsp;2.2 for the measurement.", LEAD))
+
+    st.append(Paragraph("11.1  What arrives, and how often", H2))
+    st += table([
+        ["Stream", "Rate (measured)", "Latency", "Carried by"],
+        ["Video, UDP :11111", "27.6 Hz median<br/>(17.0 – 30.1)", "150 – 350 ms,<br/>jittery",
+         "H.264, 960×720, decoded by djitellopy"],
+        ["State, UDP :8890", "9.99 Hz median<br/>(9.49 – 10.53)", "~10 ms",
+         "one ASCII line, ~150 bytes"],
+        ["Commands, UDP :8889", "on demand", "blocking,<br/>7 s timeout", "text, one at a time"],
+    ], widths=[38 * mm, 33 * mm, 27 * mm, 66 * mm])
+    st.append(Paragraph(
+        "The ratio matters more than either number: <b>2.8 images arrive per telemetry "
+        "packet</b>. That single fact drives the scheduling design in 11.4 and caused a "
+        "real defect described there.", CAP))
+
+    st.append(Paragraph("11.2  Telemetry path, packet by packet", H2))
+    st.append(para(
+        "The SDK broadcasts state; it is not polled. But djitellopy exposes only a "
+        "dictionary that its receiver thread overwrites in place, with no sequence number "
+        "and no arrival timestamp. So the driver polls that dictionary at 50&nbsp;Hz and "
+        "publishes only when the contents <i>change</i> "
+        "(<font face='Courier'>_on_telemetry_timer</font>)."))
+    st.append(para(
+        "Polling faster than the source and detecting change is not a workaround for "
+        "laziness — it is what bounds the timestamp error. Sampling on an independent "
+        "10&nbsp;Hz timer beats one aperiodic stream against another: you get duplicated "
+        "samples, dropped samples, and a stamp that is the <i>timer's</i> firing instant "
+        "rather than the packet's arrival, displaced by an unbounded 0–100&nbsp;ms. A fixed "
+        "camera–IMU offset can be calibrated out; a randomly varying one cannot. Polling at "
+        "50&nbsp;Hz bounds that displacement to one 20&nbsp;ms poll period."))
+    st += code(
+        "raw SDK line   pitch:0;roll:-1;yaw:35;vgx:42;vgy:0;vgz:-3;templ:62;temph:65;\n"
+        "               tof:104;h:100;bat:73;baro:105.30;time:0;agx:-3.00;agy:8.00;agz:-1002.00\n"
+        "\n"
+        "conversions applied by the driver (tello/node.py):\n"
+        "  agx,agy,agz   milli-g            ->  m/s^2   x G0/1000, then FRD -> FLU\n"
+        "  vgx,vgy,vgz   cm/s               ->  m/s     x 0.01,    then FRD -> FLU\n"
+        "  pitch,roll,yaw  deg, NED-referenced ->  quaternion, ENU-referenced\n"
+        "  baro          (djitellopy x100)  ->  m       /100, biased, NOT height AGL\n"
+        "  tof           cm                 ->  m       /100, valid 0.1-1.2 m only\n"
+        "  h             cm                 ->  m       /100, decimetre resolution")
+    st.append(Paragraph(
+        "A level, stationary Tello reports <font face='Courier'>agz ≈ −1002</font>. An "
+        "accelerometer measures specific force <b>f = a − g</b>; at rest a = 0, so in an "
+        "FRD frame (z down) f = [0, 0, −9.81]. That is why the raw sign is negative, and why "
+        "after the FLU conversion the published value is <b>+9.81</b> on z — which is what "
+        "REP-145 requires a <font face='Courier'>sensor_msgs/Imu</font> publisher to emit.", CAP))
+
+    st.append(Paragraph("11.3  Manufacturing an angular rate that does not exist", H2))
+    st.append(para(
+        "The propagation model needs ω. The drone publishes orientation. Differentiating "
+        "orientation is the only route, and doing it naively — subtracting Euler angles — "
+        "breaks at wrap-around and is wrong whenever roll and yaw both change. The correct "
+        "finite difference is taken on the manifold "
+        "(<font face='Courier'>TelloImuSurrogate.update</font>):"))
+    st += eq("ω  ≈  Log( q_{k-1}^{-1} ⊗ q_k ) / dt")
+    st.append(para(
+        "exact for a constant-rate rotation over the interval, with no wrap-around "
+        "pathology. Two properties of the result must be respected downstream. First, its "
+        "noise is dominated by <i>quantisation</i>, not by any MEMS gyro: whole-degree "
+        "attitude at 10&nbsp;Hz gives a uniform quantiser of width q = 1°, whose standard "
+        "deviation is q/√12, and differentiating over dt inflates that to"))
+    st += eq("σ_ω  ≈  q / (dt·√6)  ≈  1° / (0.1 s · 2.449)  ≈  4.1 °/s  ≈  0.071 rad/s")
+    st.append(para(
+        "which is the value <font face='Courier'>gyro_noise_density</font> is set from. "
+        "Second, when a packet is duplicated or a gap is too long, the surrogate returns "
+        "<b>None</b> rather than a number, and the filter propagates on its bias estimate "
+        "with inflated covariance. Substituting zero would assert <i>“the drone did not "
+        "rotate”</i> — a confident lie that corrupts the attitude covariance and, through "
+        "it, everything conditioned on attitude."))
+
+    st.append(Paragraph("11.4  Scheduling: whose clock does the filter run on?", H2))
+    st.append(para(
+        "Video lands 150–350 ms after capture; telemetry in about 10 ms. Fusing each as it "
+        "arrives would apply visual measurements to a state that has already moved on — an "
+        "out-of-sequence measurement, which a plain EKF handles by being wrong. So telemetry "
+        "is <i>buffered</i> (3 s ring) and the filter is advanced only up to each image's "
+        "offset-corrected capture time. The published odometry is therefore deliberately "
+        "~250 ms old but self-consistent; "
+        "<font face='Courier'>~/pose_predicted</font> carries a forward extrapolation for "
+        "control, on its own topic and with inflated covariance, so it cannot be mistaken "
+        "for a measurement."))
+    st += callout(
+        "A defect this design created, and how it was found",
+        ["Because images outnumber telemetry packets 2.8:1, an image time almost never "
+         "coincides with a telemetry sample. <font face='Courier'>_advance_to</font> "
+         "replayed buffered samples and stopped at the last one at or before the image "
+         "time — it never propagated the remaining interval. Measured over the real rates, "
+         "the state was a <b>mean of 49 ms and up to 99 ms behind</b> the image it was about "
+         "to be compared against: 2.5 cm of un-modelled motion at 0.5 m/s injected into "
+         "every visual update, and a published pose carrying a stamp it was not valid at.",
+         "Fixed by propagating the residual interval with a zero-order hold on the last IMU "
+         "sample — what the propagation model already assumes between samples. The target is "
+         "<i>clamped to the newest buffered telemetry</i>, because running the filter ahead "
+         "of the telemetry clock would make the next arriving sample older than "
+         "<font face='Courier'>last_fused_t</font> and get it silently dropped. "
+         "<font face='Courier'>test_fusion_timing.py</font> pins both halves."],
+        kind="warn")
+
+    st.append(Paragraph("11.5  One image, step by step", H2))
+    st += table([
+        ["#", "Step", "Where", "Cost"],
+        ["1", "Convert to grayscale, downscale to 480 px wide, rescale K to match "
+              "(<b>not</b> D — distortion is dimensionless)",
+         "<font face='Courier'>VoFrontend._prepare</font>", "0.3 ms"],
+        ["2", "Track existing features into the new frame with pyramidal KLT, then track "
+              "the result <i>back</i> and reject any point that does not return",
+         "<font face='Courier'>FeatureTracker.track</font>", "0.8 ms"],
+        ["3", "If fewer than 90 survive, top up with grid-bucketed Shi–Tomasi, one quota "
+              "per cell",
+         "<font face='Courier'>FeatureTracker.detect</font>", "1.9 ms<br/>(occasional)"],
+        ["4", "Pair keyframe and live observations <b>by feature id</b>, never by array "
+              "position",
+         "<font face='Courier'>matched_pairs</font>", "&lt;0.1 ms"],
+        ["5", "Remove the predicted rotation from the flow and take the median: this is "
+              "parallax, and it decides whether to make a keyframe",
+         "<font face='Courier'>rotation_compensated_flow</font>", "&lt;0.1 ms"],
+        ["6", "<i>Only on a keyframe:</i> undistort the ~150 points, score H against F, "
+              "recover (R, t̂), measure de-rotated parallax",
+         "<font face='Courier'>estimate_relative_pose</font>", "1.0 ms"],
+        ["7", "Attach a per-measurement σ from inlier count and parallax",
+         "<font face='Courier'>VisualMeasurement.noise_std</font>", "&lt;0.1 ms"],
+    ], widths=[7 * mm, 74 * mm, 51 * mm, 32 * mm])
+
+    st.append(Paragraph("11.6  Why each of those choices, and not the obvious alternative", H2))
+    st.append(Paragraph("KLT tracking rather than ORB matching", H3))
+    st.append(para(
+        "ORB-SLAM2 detects and describes ~1000 ORB features on <i>every</i> frame and matches "
+        "them by Hamming distance. That is the right architecture when the same features must "
+        "also serve relocalisation and loop closure — which is exactly why ORB-SLAM2 remains "
+        "the optional map backend here. It is the wrong architecture for a low-latency "
+        "odometry front-end, where detect-and-describe dominates the per-frame cost. Sparse "
+        "Lucas–Kanade reuses features across frames and pays for detection only when the "
+        "track count falls: measured at <b>0.8 ms</b> for both KLT passes versus "
+        "<b>1.9 ms</b> for a single detection round. Its weakness — no descriptors, so no "
+        "relocalisation after total loss — is precisely the gap the ORB-SLAM2 backend fills. "
+        "The two are complementary, not redundant."))
+    st.append(Paragraph("Forward–backward validation", H3))
+    st.append(para(
+        "Track a point forward, then track the result back; if it does not land where it "
+        "started, the correspondence is wrong. One extra KLT call removes most of the "
+        "drift-inducing bad matches that RANSAC would otherwise have to absorb, and it does "
+        "so <i>before</i> the geometry stage rather than after."))
+    st.append(Paragraph("Grid bucketing on detection", H3))
+    st.append(para(
+        "<font face='Courier'>goodFeaturesToTrack</font> piles features onto the highest-"
+        "contrast region — typically one window or one poster. Features clustered in a small "
+        "image region give a nearly degenerate geometry and a translation direction with "
+        "enormous variance. A per-cell quota costs 0.8 ms over a single call and buys "
+        "conditioning; that trade was measured before being accepted."))
+    st.append(Paragraph("Never undistorting the image", H3))
+    st.append(para(
+        "Undistorting a full frame every cycle is pure waste. Distortion is a smooth warp "
+        "that KLT handles happily; the correction is applied to the ~150 <i>points</i> that "
+        "reach the geometry stage, via <font face='Courier'>cv2.undistortPoints</font>, which "
+        "applies K⁻¹ and removes distortion in one step."))
+    st.append(Paragraph("Model selection between E and H", H3))
+    st.append(para(
+        "Indoor flying means floors, walls and ceilings — exactly the degenerate "
+        "configuration where the essential matrix is not uniquely determined and "
+        "<font face='Courier'>recoverPose</font> returns confident nonsense. A homography is "
+        "scored against a fundamental matrix by symmetric transfer error, and the model "
+        "switches when the scene is plane-dominated. The score is a raw chi-square quantile "
+        "compared against an already-normalised residual; multiplying it by σ² a second time "
+        "— a tempting symmetry — makes the threshold ~10⁵ times too small and classifies "
+        "every point an outlier. That bug existed and was caught by a planar-scene test."))
+    st.append(Paragraph("Rotation-compensated keyframe triggering", H3))
+    st.append(para(
+        "A rotation induces pixel motion indistinguishable in character from translation, so "
+        "a raw-displacement trigger fires on <i>turning</i> rather than on <i>moving</i> — "
+        "the worst possible moment to make a keyframe, because the baseline is near zero, "
+        "parallax is near zero, the essential matrix is ill conditioned and model selection "
+        "drifts to the homography. Removing the prior rotation costs one 3×3 matrix and a "
+        "projective divide over 150 points. Measured effect: median parallax at the keyframe "
+        "rose from 0.6° to 1.5°, and the essential path replaced the homography path in "
+        "almost every frame."))
+
+    st.append(Paragraph("11.7  Where the metric scale comes from — and does not", H2))
+    st.append(para(
+        "This is the single most important structural decision in the estimator, and the "
+        "one that a later flight failure proved was correctly reasoned but incorrectly "
+        "parameterised (Section&nbsp;12)."))
+    st.append(para(
+        "The visual update constrains <b>rotation and translation direction only</b>. A "
+        "monocular camera cannot observe scale — that is not an implementation limit, it is "
+        "geometry — and pretending otherwise is how mono-VIO pipelines acquire a slowly "
+        "wrong scale that poisons everything downstream. The translation residual therefore "
+        "lives in the 2-D tangent plane of the unit sphere at the measured bearing:"))
+    st += eq("u  =  d / ‖d‖            r_dir  =  B(t̂)ᵀ ( t̂ − u )        B ∈ ℝ^{3×2}")
+    st.append(para(
+        "A bearing carries exactly two degrees of freedom. Treating it as a 3-vector residual "
+        "— the common shortcut — silently adds a phantom constraint along the radial "
+        "direction and biases the very scale the rest of the filter worked to establish."))
+    st.append(para(
+        "Magnitude therefore enters only from signals that are genuinely metric: the "
+        "onboard optical-flow body velocity, the barometer, the downward ToF, and "
+        "gravity-referenced accelerometer integration. This split is what makes the "
+        "estimator metric without the 100–200 Hz gyroscope the drone does not have."))
+    st += callout(
+        "The corollary that bit us",
+        "If the metric signal is wrong, <b>nothing in the visual pipeline can detect it</b>. "
+        "Scaling a trajectory leaves every bearing unchanged, so a 10× velocity error "
+        "produces a perfectly self-consistent estimate of a drone flying ten times too fast "
+        "— with the front-end reporting 170+ inliers and near-zero rejections throughout. "
+        "Section&nbsp;12 is what that looked like in the air. "
+        "<font face='Courier'>test_a_wrong_speed_scale_cannot_be_fixed_by_vision</font> now "
+        "asserts this blindness directly, so the reasoning is pinned rather than remembered.",
+        kind="warn")
+
+    st.append(Paragraph("11.8  The filter update, in the order it happens", H2))
+    st += code(
+        "on_image(msg):\n"
+        "    t_img = stamp - time_offset          # corrected capture time\n"
+        "    _advance_to(t_img)                   # replay telemetry + zero-order hold\n"
+        "    R_prior = R_BC^T (R_c^T R) R_BC      # formed AFTER advancing, so it is current\n"
+        "    meas = frontend.process(img, t_img, R_prior)     # heavy: runs outside the lock\n"
+        "    if meas:\n"
+        "        update_visual_relative(...)      # 3 rot + 2 bearing, chi-square gated\n"
+        "        clone()                          # snapshot pose AFTER the correction\n"
+        "    publish(t_img)\n"
+        "\n"
+        "_advance_to(t):\n"
+        "    for s in buffer where last_fused < s.t <= t:\n"
+        "        propagate(s.accel, s.gyro, s.t - last_fused)\n"
+        "        update_attitude(s.quat)                     # 10 Hz, gravity-referenced\n"
+        "        if s.stationary: update_zero_velocity();  update_zero_angular_rate()\n"
+        "        else:            update_body_velocity(s.vel_body)   # METRIC SCALE\n"
+        "        update_barometer(s.baro);  update_tof(s.tof)\n"
+        "    propagate(last.accel, last.gyro, min(t, newest_telemetry) - last_fused)")
+    st.append(Paragraph(
+        "The clone is taken <i>after</i> the visual update, so the new keyframe's reference "
+        "pose is the corrected one rather than the pre-update guess. It is not a copy of the "
+        "mean: <font face='Courier'>P ← J P Jᵀ</font> carries the full covariance and "
+        "cross-covariance, which is the entire point of stochastic cloning.", CAP))
+    return st
+
+
+# --------------------------------------------------------------------------- #
+# 12. What went wrong in flight
+# --------------------------------------------------------------------------- #
+
+def sec_flight():
+    st = h1("12", "What went wrong in flight",
+            "Three hypotheses, two refuted by testing, one root cause")
+
+    st.append(para(
+        "On the first real flights the position estimate ran away: tens of metres in a few "
+        "seconds, indoors. This section records the diagnosis honestly, including the two "
+        "explanations that were implemented, tested, found wrong, and reverted — because the "
+        "discipline of refuting your own hypothesis is the transferable part.", LEAD))
+
+    st.append(Paragraph("12.1  The observation", H2))
+    st += code(
+        "  110 s stationary on a desk\n"
+        "     p=[-0.00 +0.00 +0.10]m  sigma 0.11 -> 0.14   |v|=0.00 m/s   vo: tracking(180)\n"
+        "     0 rejections.  The estimator was behaving perfectly.\n"
+        "\n"
+        "  take-off:  z climbs 0.21 -> 0.40 -> 0.45 -> 0.58 m,  |v| = 0.19 - 0.27 m/s\n"
+        "\n"
+        "  then, within one status period:\n"
+        "     p=[-1.97  -1.58 +0.04]m   |v|=4.24 m/s\n"
+        "     p=[-6.63  -8.06 +0.10]m   |v|=4.35 m/s\n"
+        "     p=[-21.06 -29.04 +0.10]m  |v|=4.12 m/s     34 m in 8 s, in a small room")
+
+    st.append(Paragraph("12.2  Hypothesis 1 — gate starvation (REFUTED)", H2))
+    st.append(para(
+        "The chi-square gate compares an innovation against the filter's <i>own</i> "
+        "covariance. If the state diverges while the covariance stays small, every honest "
+        "measurement looks like an outlier and is rejected; the filter then free-runs until "
+        "process noise reopens the gate. Plausible, and it would explain a sustained wrong "
+        "velocity."))
+    st.append(para(
+        "<b>Tested and refuted.</b> A filter initialised with v = 3 m/s believed at σ = 2 cm, "
+        "fed truthful zero-velocity measurements, <i>recovers on its own in 1.1 s</i> — the "
+        "accelerometer process noise inflates the covariance faster than the gate can starve "
+        "it. The recovery mechanism that had been written for this was deleted rather than "
+        "shipped."))
+
+    st.append(Paragraph("12.3  Hypothesis 2 — sustained attitude error (REFUTED)", H2))
+    st.append(para(
+        "A tilt error leaks gravity into the accelerometer's horizontal axes, and integrating "
+        "that produces a velocity ramp. <b>Tested and refuted:</b> a filter holding a "
+        "<i>constant 20° tilt error</i> while the drone sits level and still accumulates "
+        "0.14 m of position error over 20 s, with <b>zero</b> gate rejections. The body-"
+        "velocity update simply corrects it. Two orders of magnitude too small to explain "
+        "the observation."))
+
+    st.append(Paragraph("12.4  Root cause — a units error, ten times over", H2))
+    st.append(para(
+        "<font face='Courier'>speed_to_mps</font> was 0.1, i.e. decimetres per second. The "
+        "SDK's <font face='Courier'>vgx/vgy/vgz</font> are <b>centimetres per second</b>."))
+    st.append(Paragraph("Evidence, in the order it was gathered", H3))
+    st += bullets([
+        "<b>The SDK document.</b> It states a unit for every other speed it defines — "
+        "<font face='Courier'>speed?</font> “(cm/s)”, <font face='Courier'>speed x</font> "
+        "“cm/s”, <font face='Courier'>go x y z speed</font> “(cm/s)”. For "
+        "<font face='Courier'>vgx</font> it says only “the speed of the x axis”, with no "
+        "unit. cm/s is the document's own convention throughout.",
+        "<b>The flight.</b> A sustained 4.24 m/s while the drone hovered gently below 0.6 m "
+        "in a small room. At cm/s the same telemetry reads 0.42 m/s, and the 34 m becomes "
+        "3.4 m — which is what physically happened.",
+        "<b>The earlier runaway.</b> Same signature: 3.19–4.35 m/s sustained, i.e. "
+        "0.32–0.44 m/s once rescaled. One cause, two occurrences.",
+    ])
+    st += callout(
+        "Why every other safeguard missed it",
+        ["This constant sets the metric scale of the whole estimator, and it is the one error "
+         "the visual pipeline <b>structurally cannot see</b> (Section&nbsp;11.7): scaling a "
+         "trajectory leaves every bearing unchanged. The chi-square gates did not fire "
+         "because the measurements were mutually consistent — they were consistently wrong. "
+         "The front-end reported 170+ inliers throughout. Nothing was broken except the "
+         "number.",
+         "The original value came from a community reading that the code itself documented as "
+         "uncertain, alongside <font face='Courier'>tof</font> and <font face='Courier'>baro"
+         "</font>. Documenting an assumption is not the same as verifying it, and an "
+         "unverified constant in the one place vision cannot check is the worst possible "
+         "place to leave one."],
+        kind="warn")
+
+    st.append(Paragraph("12.5  The guard that now exists", H2))
+    st.append(para(
+        "Being right this time is not enough; the class of fault has to become detectable "
+        "on-board. <font face='Courier'>_check_speed_scale</font> cross-checks the integrated "
+        "vertical flow velocity against the <i>independent</i> height signal during any climb "
+        "or descent larger than 0.30 m:"))
+    st += eq("implied_scale  =  Δh  /  ∫ vgz_raw dt          ratio = implied / configured")
+    st.append(para(
+        "Both quantities come from the drone, but they are different measurements — one a "
+        "velocity from the flow sensor, one a height — so integrating the first must "
+        "reproduce a change in the second. The check reports the implied scale and refuses "
+        "to apply it: a self-tuning scale factor would hide exactly the fault it exists to "
+        "find. Alongside it, the status line now reports accept/reject counts for "
+        "<i>every</i> aiding sensor rather than only vision, which is what made the original "
+        "log misleading — it showed a healthy front-end while a different sensor steered the "
+        "estimate off a cliff."))
+    return st
+
+
+# --------------------------------------------------------------------------- #
 # 11. Results
 # --------------------------------------------------------------------------- #
 
 def sec11():
-    st = h1("11", "Results", "Measured performance, and what the camera is actually worth")
+    st = h1("13", "Results", "Measured performance, and what the camera is actually worth")
 
-    st.append(Paragraph("11.1  Test suite", H2))
+    st.append(Paragraph("13.1  Test suite", H2))
     st.append(para(
-        "116 tests, all passing, none requiring a drone or a ROS installation. They are "
+        "172 tests, all passing, none requiring a drone or a ROS installation. They are "
         "organised around <i>failure modes</i> rather than around functions.", LEAD))
     st += table([
         ["Suite", "n", "What it pins down"],
@@ -1399,11 +1768,11 @@ def sec11():
          "End-to-end simulated flight — the numbers below."],
     ], widths=[40 * mm, 9 * mm, 115 * mm])
 
-    st.append(Paragraph("11.2  Simulated flight", H2))
+    st.append(Paragraph("13.2  Simulated flight", H2))
     st.append(para(
         "A 60&nbsp;s figure-of-eight at ~1.5&nbsp;m and ~0.5&nbsp;m/s, with the drone's real "
         "limitations modelled: 10&nbsp;Hz telemetry with 12&nbsp;ms of jitter, whole-degree "
-        "attitude quantisation, milli-g accelerometer quantisation, integer-decimetre velocity, "
+        "attitude quantisation, milli-g accelerometer quantisation, integer-centimetre velocity, "
         "a drifting barometer, a yaw free-running at 0.4°/s, and monocular vision that supplies "
         "bearing but never scale."))
     st += table([
@@ -1421,7 +1790,7 @@ def sec11():
          "ideal 3.0 — mildly over-confident, growing with time"],
     ], widths=[52 * mm, 42 * mm, 70 * mm])
 
-    st.append(Paragraph("11.3  What the camera is actually worth", H2))
+    st.append(Paragraph("13.3  What the camera is actually worth", H2))
     st += figure("vision_benefit.png",
                  "Figure 9 — ATE with and without the visual front-end, as the Tello's own "
                  "optical-flow velocity degrades. Mean of 5 seeds, 40 s each, log scale.",
@@ -1449,32 +1818,72 @@ def sec11():
         "healthy you should spend your effort on loop closure rather than on front-end tuning, "
         "and it tells you exactly which flight conditions make the camera load-bearing.", "good")
 
-    st.append(Paragraph("11.4  Compute budget", H2))
-    st += table([
-        ["Stage", "Cost", "Notes"],
-        ["KLT tracking + detection, 480×360, ~150 features", "~3 ms/frame",
-         "measured; scales with feature count and pyramid levels"],
-        ["Essential/homography estimation + model scoring", "~1–2 ms/keyframe",
-         "only on keyframes, not every frame"],
-        ["ESKF propagate + all updates", "&lt; 0.1 ms", "22×22"],
-        ["Fixed-lag smoother, window 10", "~0.3 ms/keyframe", "150×150 dense Cholesky"],
-        ["ORB-SLAM2 tracking (optional backend)", "~15–25 ms/frame",
-         "separate process; this is what the budget is really spent on"],
-    ], widths=[68 * mm, 25 * mm, 71 * mm])
+    st.append(Paragraph("13.4  Compute budget — measured, not estimated", H2))
     st.append(para(
-        "The fast path leaves ample headroom inside a 33&nbsp;ms frame budget on one core. If "
-        "you enable the ORB-SLAM2 backend, that is where the time goes — and it is worth it "
-        "only for the loop closure, since the front-end here already covers odometry."))
-    st.append(PageBreak())
+        "The numbers below were measured on the target machine at the resolution the "
+        "front-end actually runs at (480×360), driving the pipeline at the <i>measured</i> "
+        "hardware rates of 27.6 Hz images and 10 Hz telemetry — not at nominal rates and not "
+        "per-stage in isolation."))
+    st += table([
+        ["Path", "mean", "p95", "max", "budget", "verdict"],
+        ["Image: KLT track + keyframe logic (+ geometry on keyframes)",
+         "2.00 ms", "5.70 ms", "8.03 ms", "36.2 ms", "22 % of one frame, worst case"],
+        ["Telemetry: propagate + attitude + velocity + barometer",
+         "0.50 ms", "0.67 ms", "0.76 ms", "100 ms", "&lt;1 %"],
+    ], widths=[62 * mm, 16 * mm, 16 * mm, 16 * mm, 18 * mm, 38 * mm])
+    st += callout(
+        "Total: 6.0 % of one core, 17× headroom, 0 of 120 frames over budget",
+        "Speed was never the constraint. Every defect found in this project was an "
+        "<i>accuracy</i> defect. That is worth stating plainly because “make it fast” is the "
+        "instinctive response to a drone that misbehaves, and here it would have been "
+        "entirely wasted effort.",
+        kind="good")
+
+    st.append(Paragraph("Where the time actually went, before it was fixed", H3))
+    st.append(para(
+        "Profiling found the real cost was not in the estimator at all. "
+        "<font face='Courier'>nav_msgs/Path</font> re-serialises <i>every</i> pose on "
+        "<i>every</i> publish: 5 ms at 2000 poses, and at the 30 Hz odometry rate that is "
+        "~150 ms/s of CPU — more than the entire estimator — for a display whose content "
+        "changes imperceptibly between frames. Poses are now appended at full rate and the "
+        "topic published at 2 Hz. The debug image, drawn and serialised at 506 KB per frame "
+        "whenever RViz subscribed, is capped at 10 Hz."))
+    st.append(Paragraph("Measured, and deliberately not optimised", H3))
+    st += bullets([
+        "<font face='Courier'>findFundamentalMat</font> costs <b>0.01 ms</b>. Removing it to "
+        "“save time” would delete the model-selection evidence for a rounding error.",
+        "Grid-bucketed detection costs <b>0.8 ms</b> over a single "
+        "<font face='Courier'>goodFeaturesToTrack</font> call, and buys geometric "
+        "conditioning. Accepted deliberately.",
+        "Reusing KLT pyramids across the forward and backward passes would save ~0.3 ms of "
+        "the 2.0 ms image path. Not worth the state it would add.",
+        "<font face='Courier'>rclpy.get_parameter()</font> costs <b>0.29 µs</b>; the six "
+        "lookups per image are 0.005 % of a core. Left alone.",
+    ])
+    st.append(Paragraph(
+        "The point of listing the rejected optimisations is that each was measured before "
+        "being rejected. An optimisation nobody measured is indistinguishable from a "
+        "superstition.", CAP))
+
+    st.append(Paragraph("13.5  What is measured versus what is simulated", H2))
+    st += callout(
+        "Read this before quoting any accuracy number from this report",
+        ["<b>Measured on hardware:</b> all sensor rates (Section 2.1), all compute costs "
+         "above, the front-end's uncertainty calibration, and the failure described in "
+         "Section 12.",
+         "<b>Simulated:</b> every trajectory-accuracy figure — the 0.57 m ATE, the scale "
+         "recovery, the NEES consistency, the vision-versus-no-vision comparison. These come "
+         "from synthetic flights with known ground truth, and they validate that the "
+         "<i>mathematics</i> is right. They are not claims about what this drone achieves in "
+         "your room.",
+         "Closing that gap needs a metric reference: Section 14 covers the three options and "
+         "<font face='Courier'>evaluate_bag</font> produces ATE, RPE and drift against one."],
+        kind="warn")
     return st
 
 
-# --------------------------------------------------------------------------- #
-# 12-13 + appendix
-# --------------------------------------------------------------------------- #
-
 def sec12():
-    st = h1("12", "Bring-up procedure", "The order to do things in, and why that order")
+    st = h1("14", "Bring-up procedure", "The order to do things in, and why that order")
 
     st.append(para(
         "Each step depends on the previous one being right. Doing them out of order does not "
@@ -1484,7 +1893,7 @@ def sec12():
     st += code(
         "./scripts/install.sh                        # Ubuntu 22.04 + ROS 2 Humble\n"
         "./scripts/build.sh\n"
-        "cd workspace/src/tello_vio && python3 -m pytest test/ -q     # 116 tests, no drone needed")
+        "cd workspace/src/tello_vio && python3 -m pytest test/ -q     # 172 tests, no drone needed")
 
     st.append(Paragraph("Step 1 — Camera intrinsics", H3))
     st.append(para(
@@ -1547,7 +1956,7 @@ def sec12():
 
 
 def sec13():
-    st = h1("13", "Limitations and next steps", "What this does not do")
+    st = h1("15", "Limitations and next steps", "What this does not do")
 
     st.append(Paragraph("Limitations", H2))
     st += bullets([
@@ -1725,7 +2134,7 @@ def build():
     story.append(PageBreak())
     story += build_toc()
     for fn in (sec1, sec2, sec3, sec4, sec5, sec6, sec7, sec8, sec9, sec10,
-               sec11, sec12, sec13, appendix):
+               sec_pipeline, sec_flight, sec11, sec12, sec13, appendix):
         story += fn()
     doc.build(story)
     print("wrote", OUT)
