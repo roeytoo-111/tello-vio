@@ -227,3 +227,73 @@ def test_frontend_cost_fits_a_30hz_budget():
     ms = (time.perf_counter() - t0) / len(imgs) * 1e3
     print(f"\nfront-end: {ms:.2f} ms/frame at {fe.cfg.work_width}px wide")
     assert ms < 33.0, f"{ms:.1f} ms/frame exceeds the 30 Hz budget"
+
+
+# --------------------------------------------------------------------------- #
+# Regression: mid-interval re-detection
+# --------------------------------------------------------------------------- #
+
+def test_redetection_midway_does_not_break_correspondence():
+    """Crashed in flight: ValueError broadcasting (180,2) against (77,2).
+
+    `detect()` tops the track set back up as soon as tracking thins out. The
+    old code aligned the keyframe observations to the live ones by array
+    position, which stops being true the instant new features are added -- the
+    rotation-compensated flow then differenced a 180-point live set against a
+    77-point prediction and took the whole estimator down with it.
+
+    Correspondence is now resolved by feature id, so the two sets can differ in
+    length freely. Driven hard here: features are forced to die every frame so
+    re-detection fires constantly.
+    """
+    X, rng = make_cloud(700, seed=11)
+    cfg = FrontendConfig(min_features=150, max_features=180,
+                         kf_min_interval_s=0.0, kf_min_parallax_px=6.0)
+    fe = VoFrontend(K, D, cfg)
+
+    prev_R = np.eye(3)
+    for k in range(40):
+        R_cw = lie.euler_zyx_to_rot(0.05 * k, 0.02 * np.sin(k), 0.0)
+        p_wc = np.array([0.05 * k, 0.02 * k, 0.0])
+        img = render(X, R_cw, -R_cw @ p_wc, rng)
+
+        # A rotation prior is what exercises the failing path.
+        prior = R_cw @ prev_R.T
+        prev_R = R_cw
+
+        # Kill half the tracks to guarantee detect() fires mid-interval.
+        if fe.tracker.pts.shape[0] > 20 and k % 2 == 0:
+            keep = fe.tracker.pts.shape[0] // 2
+            fe.tracker.pts = fe.tracker.pts[:keep]
+            fe.tracker.ids = fe.tracker.ids[:keep]
+
+        fe.process(img, stamp=k * 0.05, R_pred_c1c2=prior)  # must not raise
+
+        kf_m, cur_m = fe.matched_pairs()
+        if kf_m is not None:
+            assert kf_m.shape == cur_m.shape, "matched pairs must align"
+
+
+def test_matched_pairs_align_by_id_not_position():
+    """The property the fix rests on."""
+    fe = VoFrontend(K, D, FrontendConfig())
+    fe.kf_pts = np.array([[0., 0.], [1., 1.], [2., 2.], [3., 3.]], np.float32)
+    fe.kf_ids = np.array([10, 11, 12, 13], dtype=np.int64)
+
+    # Tracker lost id 11, kept the rest, and gained two brand-new features.
+    fe.tracker.pts = np.array([[0., 9.], [2., 9.], [3., 9.], [7., 7.], [8., 8.]], np.float32)
+    fe.tracker.ids = np.array([10, 12, 13, 20, 21], dtype=np.int64)
+
+    kf_m, cur_m = fe.matched_pairs()
+    assert len(kf_m) == len(cur_m) == 3
+    assert np.allclose(kf_m[:, 0], [0., 2., 3.])   # ids 10, 12, 13
+    assert np.allclose(cur_m[:, 1], [9., 9., 9.])  # their current positions
+
+
+def test_matched_pairs_handles_total_loss():
+    fe = VoFrontend(K, D, FrontendConfig())
+    fe.kf_pts = np.array([[0., 0.]], np.float32)
+    fe.kf_ids = np.array([1], dtype=np.int64)
+    fe.tracker.pts = np.zeros((0, 2), np.float32)
+    fe.tracker.ids = np.zeros((0,), dtype=np.int64)
+    assert fe.matched_pairs() == (None, None)

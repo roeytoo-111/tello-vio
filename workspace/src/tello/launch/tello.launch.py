@@ -16,8 +16,9 @@ sample happened to win. A TF edge has exactly one owner.
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
@@ -64,6 +65,9 @@ def generate_launch_description():
     rviz = Node(
         package='rviz2', executable='rviz2', name='rviz2', output='screen',
         condition=IfCondition(LaunchConfiguration('rviz')),
+        # Without -d, RViz opens with no displays at all and looks broken.
+        arguments=['-d', PathJoinSubstitution(
+            [FindPackageShare('tello'), 'rviz', 'tello.rviz'])],
     )
 
     rqt = Node(

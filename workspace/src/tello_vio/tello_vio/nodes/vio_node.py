@@ -41,6 +41,7 @@ camera-IMU extrinsic literally inexpressible in the system.
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -149,8 +150,20 @@ class VioNode(Node):
         p("vo_enable", True)
 
         p("publish_debug_image", True)
+        # Debug image is a human-facing view; 10 Hz is plenty and the draw +
+        # 506 KB serialize at full 30 Hz is measurable CPU for no insight.
+        p("debug_image_hz", 10.0)
         p("publish_path", True)
+        # nav_msgs/Path re-serialises EVERY pose on EVERY publish: measured
+        # 5 ms per message at 2000 poses. At the 30 Hz odom rate that is
+        # ~150 ms/s -- more CPU than the entire estimator -- for a display
+        # whose content changes imperceptibly between frames. The pose is
+        # still APPENDED at full rate (cheap), only the publish is limited.
+        p("path_pub_hz", 2.0)
         p("path_max_poses", 2000)
+        # One human-readable summary line in the console every N seconds, so
+        # the node's health is visible without rqt or topic echo. 0 disables.
+        p("status_period_s", 2.0)
         p("telemetry_buffer_s", 3.0)
         p("diagnostics_hz", 2.0)
 
@@ -213,6 +226,10 @@ class VioNode(Node):
         self._path = Path()
         self._path.header.frame_id = self.odom_frame
         self._path_max = int(g("path_max_poses"))
+        self._path_period = 1.0 / max(0.1, float(g("path_pub_hz")))
+        self._last_path_pub = 0.0
+        self._debug_period = 1.0 / max(0.5, float(g("debug_image_hz")))
+        self._last_debug_pub = 0.0
         self._n_images = 0
         self._n_visual = 0
         self._n_telemetry = 0
@@ -256,6 +273,10 @@ class VioNode(Node):
 
         self.create_timer(1.0 / max(0.2, float(g("diagnostics_hz"))), self.on_diagnostics,
                           callback_group=self.cb_telemetry)
+        status_period = float(g("status_period_s"))
+        if status_period > 0.0:
+            self.create_timer(status_period, self.on_status_line,
+                              callback_group=self.cb_telemetry)
         self.create_service(Trigger, "~/reset", self.on_reset,
                             callback_group=self.cb_telemetry)
 
@@ -423,7 +444,23 @@ class VioNode(Node):
             R_b1b2 = lie.quat_to_rot(self.kf.q_c).T @ self.kf.R
             R_prior = self.R_BC.T @ R_b1b2 @ self.R_BC
 
-        meas = self.frontend.process(img, t_img, R_pred_c1c2=R_prior)
+        try:
+            meas = self.frontend.process(img, t_img, R_pred_c1c2=R_prior)
+        except Exception as e:
+            # A geometry or tracking fault must degrade, never kill the node.
+            # rclpy lets an exception escape a subscription callback all the way
+            # out of spin(), taking the whole estimator down mid-flight -- so the
+            # front-end is reset and we carry on with inertial + flow only.
+            self.node_error_count = getattr(self, 'node_error_count', 0) + 1
+            self.get_logger().error(
+                f'visual front-end fault ({type(e).__name__}: {e}); resetting the '
+                f'tracker and continuing on telemetry only '
+                f'[{self.node_error_count} so far]',
+                throttle_duration_sec=5.0)
+            self.frontend.tracker.reset()
+            self.frontend.kf_pts = None
+            self.frontend.kf_ids = None
+            return
 
         with self.lock:
             self._advance_to(t_img)
@@ -443,7 +480,10 @@ class VioNode(Node):
         self._publish(t_img)
         if bool(self.get_parameter("publish_debug_image").value) and \
                 self.pub_debug.get_subscription_count() > 0:
-            self._publish_debug(img, msg.header.stamp)
+            now = time.monotonic()
+            if now - self._last_debug_pub >= self._debug_period:
+                self._last_debug_pub = now
+                self._publish_debug(img, msg.header.stamp)
 
     def _to_cv(self, msg: Image):
         try:
@@ -494,16 +534,19 @@ class VioNode(Node):
             self.tf_broadcaster.sendTransform(
                 make_transform(self.odom_frame, self.body_frame, stamp, p, q))
 
-        if bool(self.get_parameter("publish_path").value) and \
-                self.pub_path.get_subscription_count() > 0:
+        if bool(self.get_parameter("publish_path").value):
             ps = PoseStamped()
             ps.header = odom.header
             ps.pose = odom.pose.pose
             self._path.poses.append(ps)
             if len(self._path.poses) > self._path_max:
                 del self._path.poses[:len(self._path.poses) - self._path_max]
-            self._path.header.stamp = stamp
-            self.pub_path.publish(self._path)
+            now = time.monotonic()
+            if (self.pub_path.get_subscription_count() > 0
+                    and now - self._last_path_pub >= self._path_period):
+                self._last_path_pub = now
+                self._path.header.stamp = stamp
+                self.pub_path.publish(self._path)
 
     def _publish_prediction(self, t_now: float) -> None:
         """Forward-propagate the fused state to ``t_now`` for control consumers.
@@ -549,6 +592,32 @@ class VioNode(Node):
             self.pub_debug.publish(out)
         except Exception as e:                      # pragma: no cover
             self.get_logger().warn(f"debug image failed: {e}", throttle_duration_sec=5.0)
+
+    def on_status_line(self) -> None:
+        """One console line summarising the estimator, so `ros2 launch` output
+        answers "is it working?" without rqt or topic echo.
+
+        Reads: position and 1-sigma, speed, the front-end's own status string,
+        and the visual-update accept ratio -- the four numbers that tell you
+        within one glance whether VIO is healthy, degraded, or dead.
+        """
+        with self.lock:
+            if not self.kf.initialised:
+                self.get_logger().info("VIO: waiting for telemetry to initialise")
+                return
+            pos = self.kf.p.copy()
+            speed = float(np.linalg.norm(self.kf.v))
+            sig = float(np.linalg.norm(np.sqrt(np.diag(self.kf.P[0:3, 0:3]))))
+            vis = self.kf.stats.get("visual", [0, 0, 0.0])
+            vrot = self.kf.stats.get("visual_rot", [0, 0, 0.0])
+        ok = vis[0] + vrot[0]
+        rej = vis[1] + vrot[1]
+        vo = self.frontend.last_status if self.frontend is not None else "no camera_info"
+        self.get_logger().info(
+            f"VIO: p=[{pos[0]:+.2f} {pos[1]:+.2f} {pos[2]:+.2f}]m "
+            f"(σ {sig:.2f}) |v|={speed:.2f}m/s | vo: {vo} | "
+            f"visual updates {ok} ok / {rej} rejected | "
+            f"imgs={self._n_images} telem={self._n_telemetry}")
 
     def on_diagnostics(self) -> None:
         with self.lock:

@@ -189,6 +189,11 @@ class TelloControl : public rclcpp::Node
 
 		void timerCallback()
 		{
+			if (!rclcpp::ok())
+			{
+				return;
+			}
+
 			cv::Mat to_show;
 			if (has_frame)
 			{
@@ -263,7 +268,20 @@ class TelloControl : public rclcpp::Node
 int main(int argc, char * argv[])
 {
 	rclcpp::init(argc, argv);
-	rclcpp::spin(std::make_shared<TelloControl>());
+	{
+		auto node = std::make_shared<TelloControl>();
+		rclcpp::spin(node);
+	}
+	// Tear the HighGUI window down explicitly. Without this the Qt/GTK backend
+	// keeps its event loop alive after spin() returns, so the process ignores
+	// SIGINT and launch escalates to SIGTERM and then SIGKILL -- 15 seconds of
+	// waiting on every Ctrl-C.
+	try {
+		cv::destroyAllWindows();
+		cv::waitKey(1);
+	} catch (const cv::Exception &) {
+		// A headless build has no windows to destroy; nothing to do.
+	}
 	rclcpp::shutdown();
 	return 0;
 }

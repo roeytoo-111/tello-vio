@@ -310,7 +310,32 @@ class VoFrontend:
             self.K[1, 2] = (self.K_full[1, 2] + 0.5) * s - 0.5
         return gray
 
-    def rotation_compensated_flow(self, R_pred_c1c2: np.ndarray) -> np.ndarray:
+    def matched_pairs(self):
+        """Observations shared by the reference keyframe and the current frame.
+
+        Correspondence is resolved by **feature id**, never by array position.
+        Position-based alignment looks simpler and works right up until
+        ``detect()`` tops the track set up mid-interval: the keyframe array and
+        the live array then have different lengths and different meanings, and
+        every downstream consumer either crashes on a broadcast error or, worse,
+        silently pairs unrelated points. Ids are already carried through KLT, so
+        matching on them costs one ``intersect1d``.
+
+        Returns ``(kf_pts, cur_pts)`` in matching order, or ``(None, None)``.
+        """
+        if self.kf_ids is None or len(self.kf_ids) == 0:
+            return None, None
+        cur_ids = self.tracker.ids
+        if len(cur_ids) == 0:
+            return None, None
+        _, kf_idx, cur_idx = np.intersect1d(
+            self.kf_ids, cur_ids, assume_unique=True, return_indices=True)
+        if len(kf_idx) == 0:
+            return None, None
+        return self.kf_pts[kf_idx], self.tracker.pts[cur_idx]
+
+    def rotation_compensated_flow(self, R_pred_c1c2: np.ndarray,
+                                  kf_pts=None, cur_pts=None) -> np.ndarray:
         """Per-track pixel displacement with the predicted rotation removed.
 
         A rotation induces pixel motion identical in character to translation,
@@ -326,15 +351,17 @@ class VoFrontend:
         free from the drone's own attitude stream, which is the one piece of
         inertial data a Tello gives us in good shape.
         """
-        if self.kf_pts is None or len(self.kf_pts) == 0:
+        if kf_pts is None or cur_pts is None:
+            kf_pts, cur_pts = self.matched_pairs()
+        if kf_pts is None or len(kf_pts) == 0:
             return np.zeros(0)
         # Infinite-homography induced by pure rotation: H = K R K^-1.
         Hrot = self.K @ np.asarray(R_pred_c1c2, dtype=np.float64) @ np.linalg.inv(self.K)
-        p = np.hstack([self.kf_pts, np.ones((len(self.kf_pts), 1))]) @ Hrot.T
+        p = np.hstack([kf_pts, np.ones((len(kf_pts), 1))]) @ Hrot.T
         w = p[:, 2:3]
         w = np.where(np.abs(w) < 1e-12, 1e-12, w)
         pred = p[:, :2] / w
-        return np.linalg.norm(self.tracker.pts - pred, axis=1)
+        return np.linalg.norm(cur_pts - pred, axis=1)
 
     def process(self, image: np.ndarray, stamp: float,
                 R_pred_c1c2: np.ndarray | None = None) -> VisualMeasurement | None:
@@ -356,30 +383,28 @@ class VoFrontend:
             self.last_status = "bootstrap"
             return None
 
-        pts, ids, kept = self.tracker.track(gray)
+        self.tracker.track(gray)
 
-        # Keep the keyframe's observations aligned with the surviving tracks.
-        if self.kf_pts is not None and len(kept) == len(self.kf_pts):
-            self.kf_pts = self.kf_pts[kept]
-            self.kf_ids = self.kf_ids[kept]
-
-        n_tracked = len(pts)
-        if n_tracked < self.cfg.min_features:
+        # Top the track set up BEFORE matching, so the pairs below always
+        # describe the same instant as the live tracker state.
+        if len(self.tracker.pts) < self.cfg.min_features:
             self.tracker.detect(gray)
 
-        if self.kf_pts is None or n_tracked < 8:
+        kf_pts, cur_pts = self.matched_pairs()
+        n_matched = 0 if kf_pts is None else len(kf_pts)
+
+        if n_matched < 8:
             self._set_keyframe(stamp)
-            self.last_status = "too few tracks"
+            self.last_status = f"too few matches ({n_matched})"
             return None
 
         dt = stamp - self.kf_stamp
-        if n_tracked == 0:
-            disp = 0.0
-        elif R_pred_c1c2 is not None:
-            disp = float(np.median(self.rotation_compensated_flow(R_pred_c1c2)))
+        if R_pred_c1c2 is not None:
+            flow = self.rotation_compensated_flow(R_pred_c1c2, kf_pts, cur_pts)
         else:
-            disp = float(np.median(np.linalg.norm(pts - self.kf_pts, axis=1)))
-        ratio = n_tracked / max(1, len(self.kf_ids))
+            flow = np.linalg.norm(cur_pts - kf_pts, axis=1)
+        disp = float(np.median(flow)) if flow.size else 0.0
+        ratio = n_matched / max(1, len(self.kf_ids))
 
         need_kf = (
             dt >= self.cfg.kf_min_interval_s
@@ -388,11 +413,11 @@ class VoFrontend:
                  or dt > self.cfg.kf_max_interval_s)
         )
         if not need_kf:
-            self.last_status = f"tracking ({n_tracked})"
+            self.last_status = f"tracking ({n_matched})"
             return None
 
         res: TwoViewResult = estimate_relative_pose(
-            self.kf_pts, pts, self.K, self.D,
+            kf_pts, cur_pts, self.K, self.D,
             px_threshold=self.cfg.ransac_px,
             min_inliers=self.cfg.min_inliers,
             parallax_thresh_deg=self.cfg.parallax_thresh_deg,
@@ -406,7 +431,7 @@ class VoFrontend:
                 translation_reliable=res.translation_reliable,
                 n_inliers=res.n_inliers, parallax_rad=res.parallax_rad,
                 model=res.model, planar_score=res.planar_score,
-                n_tracked=n_tracked,
+                n_tracked=n_matched,
                 cost_ms=(time.perf_counter() - t0) * 1e3,
             )
             self.last_status = f"{res.model} {res.n_inliers}in"
@@ -432,9 +457,9 @@ class VoFrontend:
         vis = vis.copy()
         s = 1.0 / self._scale if self._scale else 1.0
         pts = self.tracker.pts
-        kf = self.kf_pts
-        if kf is not None and len(kf) == len(pts):
-            for (x0, y0), (x1, y1) in zip(kf * s, pts * s):
+        kf_m, cur_m = self.matched_pairs()
+        if kf_m is not None:
+            for (x0, y0), (x1, y1) in zip(kf_m * s, cur_m * s):
                 cv2.line(vis, (int(x0), int(y0)), (int(x1), int(y1)), (0, 200, 255), 1)
         for x, y in pts * s:
             cv2.circle(vis, (int(x), int(y)), 2, (0, 255, 0), -1)

@@ -294,9 +294,15 @@ CLEAN=1 ./scripts/build.sh
 ```
 
 **`OSError: [Errno 98] Address already in use` on startup.** Not a connectivity
-problem. A previous driver is still holding UDP :8889 — it outlived its launch,
-which happens when the video decoder thread dies and the node keeps spinning.
-Find and stop it:
+problem. A previous driver is still holding UDP :8889.
+
+The usual cause is stopping the launch with **Ctrl-Z instead of Ctrl-C**.
+Ctrl-Z *suspends* the process — it keeps every socket it owns, indefinitely, and
+sessions stack up invisibly. **Use Ctrl-C.** Check for suspended jobs with
+`ps -eo pid,stat,cmd | grep tello` and look for `T` in the STAT column, or `jobs`
+in the shell you launched from (`fg` then Ctrl-C, or `kill -9 %1`).
+
+Find and stop whatever holds the port:
 
 ```bash
 ss -lunp | grep -E '8889|8890|11111'

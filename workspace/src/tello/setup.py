@@ -10,6 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/tello']),
         ('share/tello', ['package.xml', 'resource/ost.txt', 'resource/ost.yaml']),
         (os.path.join('share', 'tello', 'launch'), glob('launch/*.launch.py')),
+        (os.path.join('share', 'tello', 'rviz'), glob('rviz/*.rviz')),
     ],
     install_requires=[
         'setuptools',

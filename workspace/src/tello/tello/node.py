@@ -46,6 +46,7 @@ import errno
 import logging
 import math
 import queue
+import socket
 import threading
 import time
 from typing import Optional
@@ -168,6 +169,10 @@ class TelloNode:
         # Likewise RESPONSE_TIMEOUT is captured as a default argument value at
         # import time, so it cannot be overridden by a class attribute either;
         # the timeout is passed per call instead.
+        problem = check_network_path(self.tello_ip)
+        if problem is not None:
+            raise RuntimeError('Cannot reach the drone.\n  ' + problem)
+
         node.get_logger().info(f'Tello: connecting to {self.tello_ip}')
         try:
             self.tello = Tello(host=self.tello_ip)
@@ -206,13 +211,33 @@ class TelloNode:
         try:
             self.tello.connect()
         except Exception as e:
+            detail = str(e)
+            if 'decode' in detail.lower():
+                # The drone DID answer -- with bytes that are not valid UTF-8.
+                # That is a different fault from silence and has different
+                # causes, so it gets its own advice. Usually a stale datagram
+                # left in the command socket by a previous session, or a second
+                # client (the phone app) talking to the drone at the same time.
+                raise RuntimeError(
+                    f'The drone at {self.tello_ip} replied with data that is not '
+                    'valid text, so the SDK handshake failed.\n'
+                    '  This is NOT a network problem: the drone answered, but with '
+                    'unexpected bytes.\n'
+                    '  Most likely causes, in order:\n'
+                    '    1. A previous session left the drone mid-stream. '
+                    'POWER-CYCLE the Tello and retry.\n'
+                    '    2. Another client (the Tello phone app) is connected. '
+                    'Close it.\n'
+                    '    3. A stale datagram is queued on UDP :8889 from a '
+                    'crashed driver. Check with: ss -lunp | grep 8889\n'
+                    f'  Original error: {detail}') from e
             raise RuntimeError(
                 f'No response from the drone at {self.tello_ip}.\n'
                 '  Check: the Tello is powered on (blinking LED), and this machine '
                 'is joined to its WiFi access point (TELLO-XXXXXX).\n'
                 '  On WSL2, confirm Windows is on the Tello AP -- WSL shares the '
                 'host network.\n'
-                f'  Original error: {e}') from e
+                f'  Original error: {detail}') from e
         node.get_logger().info('Tello: connected')
 
         self.tello.streamon()
@@ -246,6 +271,14 @@ class TelloNode:
         self._last_new_frame_t = 0.0
         self._video_restarts = 0
         self._video_restart_pending = False
+        # Exponential backoff between FAILED restart attempts. Each failed
+        # attempt blocks the worker thread ~7 s inside streamoff (djitellopy's
+        # fixed timeout); retrying immediately turns a WiFi dropout into a
+        # continuous stream of 7 s worker stalls -- during which a queued land
+        # command would wait behind them. 5 s -> 10 -> 20 -> 30 cap, reset on
+        # the first success.
+        self._restart_backoff = 5.0
+        self._next_restart_t = 0.0
         self._identity = None
         self._wifi_snr = ''
 
@@ -373,6 +406,7 @@ class TelloNode:
         elif cmd == 'restart_video':
             # streamoff/streamon are blocking SDK round trips, which is exactly
             # why this runs on the worker thread and not in the video timer.
+            restarted = False
             try:
                 try:
                     self._frame_read.stop()
@@ -388,8 +422,17 @@ class TelloNode:
                 self._prev_frame_obj = None
                 self._last_new_frame_t = time.time()
                 self._video_restarts += 1
+                restarted = True
+                self._restart_backoff = 5.0
                 log.info(f'Video stream restarted (#{self._video_restarts})')
             finally:
+                if not restarted:
+                    self._next_restart_t = time.time() + self._restart_backoff
+                    log.warn(
+                        f'Video restart failed; next attempt in '
+                        f'{self._restart_backoff:.0f}s (the drone is probably '
+                        f'out of WiFi range or asleep)')
+                    self._restart_backoff = min(30.0, self._restart_backoff * 2.0)
                 self._video_restart_pending = False
 
     # ------------------------------------------------------------------ #
@@ -688,7 +731,7 @@ class TelloNode:
         stalled = (self._last_new_frame_t > 0.0
                    and (time.time() - self._last_new_frame_t) > self.video_stall_timeout)
 
-        if decoder_dead or stalled:
+        if (decoder_dead or stalled) and time.time() >= self._next_restart_t:
             why = 'decoder thread exited' if decoder_dead else \
                 f'no new frame for {self.video_stall_timeout:.0f}s'
             self.node.get_logger().warn(f'Video stalled ({why}); restarting the stream')
@@ -894,6 +937,56 @@ class TelloNode:
                 fn()
             except Exception:
                 pass
+
+
+
+def _local_route_to(host: str):
+    """Return the local source address the OS would use to reach ``host``.
+
+    Uses a *connected* UDP socket, which performs a route lookup without
+    sending a single packet -- so this is safe to call before the drone is
+    known to exist.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.settimeout(0.3)
+        probe.connect((host, 9))
+        return probe.getsockname()[0]
+    except Exception:
+        return None
+    finally:
+        probe.close()
+
+
+def check_network_path(host: str):
+    """Pre-flight: are we plausibly on the drone's network at all?
+
+    The Tello is its own access point handing out 192.168.10.x. If the machine
+    sits on some other subnet, packets to 192.168.10.1 get routed upstream to
+    whatever gateway is configured, and *something out there may answer* -- which
+    surfaces as a baffling 'response decode error' rather than a timeout.
+    Diagnosing that from the SDK error alone costs an hour, so check first.
+
+    Returns ``None`` when the path looks fine, otherwise a human-readable
+    explanation.
+    """
+    local = _local_route_to(host)
+    if local is None:
+        return (f'No route to {host} at all. This machine cannot reach the drone.')
+
+    host_net = host.rsplit('.', 1)[0]
+    local_net = local.rsplit('.', 1)[0]
+    if host_net == local_net:
+        return None
+
+    return (
+        f'This machine is on {local}, but the drone is expected at {host}.\n'
+        f'  Those are different subnets, so packets to {host} are being routed to\n'
+        '  your normal gateway instead of the drone. If anything out there answers,\n'
+        "  you get a confusing 'decode error' rather than a clean timeout.\n"
+        f'  FIX: join this machine to the Tello access point (TELLO-XXXXXX). You\n'
+        f'  should then have a {host_net}.x address.\n'
+        '  On WSL2 the WiFi belongs to WINDOWS -- connect Windows to the Tello AP.')
 
 
 def main(args=None):

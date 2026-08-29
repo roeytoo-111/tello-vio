@@ -29,9 +29,14 @@ def generate_launch_description():
         DeclareLaunchArgument('config', default_value=default_config,
                               description='tello_vio parameter YAML'),
         DeclareLaunchArgument('tello_ip', default_value='192.168.10.1'),
-        DeclareLaunchArgument('video_scale', default_value='1.0',
-                              description='Driver-side downscale. camera_info is '
-                                          'rescaled to match automatically.'),
+        DeclareLaunchArgument('video_scale', default_value='0.5',
+                              description='Driver-side downscale (camera_info is '
+                                          'rescaled to match). 0.5 is the measured '
+                                          'sweet spot: the front-end works at 480 px '
+                                          'anyway, so full resolution only buys 4x '
+                                          'the DDS bandwidth (2 MB vs 0.5 MB per '
+                                          'frame) and a 2 ms RGB->BGR copy per '
+                                          'frame in the driver.'),
         DeclareLaunchArgument('video_target_fps', default_value='30.0'),
         DeclareLaunchArgument('driver', default_value='true',
                               description='Launch the Tello driver (false for bag replay)'),
