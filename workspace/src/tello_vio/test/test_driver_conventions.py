@@ -11,6 +11,7 @@ them numerically against ``tello_model``, so the two cannot diverge unnoticed.
 """
 import ast
 import math
+import re
 import textwrap
 from pathlib import Path
 
@@ -186,3 +187,67 @@ def test_identity_dedup_accepts_a_changing_scene():
         prev = f
         published += 1
     assert published == 30
+
+
+# --------------------------------------------------------------------------- #
+# Mission Pad ground truth (Tello EDU / RoboMaster TT, SDK 2.0+)
+# --------------------------------------------------------------------------- #
+
+def _driver_src():
+    if not DRIVER.exists():
+        pytest.skip("driver source not found")
+    return DRIVER.read_text()
+
+
+def test_mission_pad_sentinels_match_the_message_definition():
+    """Driver sentinels must agree with TelloMissionPad.msg or consumers
+    silently misread 'no pad' as a real pad id."""
+    msg = (DRIVER.parents[2] / "tello_msg" / "msg" / "TelloMissionPad.msg")
+    if not msg.exists():
+        pytest.skip("TelloMissionPad.msg not found")
+    text = msg.read_text()
+    for name, value in (("PAD_UNSUPPORTED", -3), ("PAD_DISABLED", -2),
+                        ("PAD_NONE", -1)):
+        # Whitespace-tolerant: the .msg aligns the '=' for readability.
+        assert re.search(rf"int32\s+{name}\s*=\s*{value}\b", text), \
+            f"{name} missing or renamed in TelloMissionPad.msg"
+    src = _driver_src()
+    for name in ("PAD_UNSUPPORTED", "PAD_DISABLED", "PAD_NONE"):
+        assert f"TelloMissionPad.{name}" in src, f"driver never sets {name}"
+
+
+def test_mission_pad_units_are_converted_from_centimetres():
+    """The SDK reports cm; ROS requires metres (REP-103)."""
+    src = _driver_src()
+    assert "/ 100.0 * self.mission_pad_signs" in src, \
+        "mission pad position must be divided by 100 (cm -> m)"
+
+
+def test_mission_pad_mpry_order_is_corrected():
+    """'mpry' is pitch,yaw,roll -- NOT roll,pitch,yaw.
+
+    Reading it in the conventional order silently swaps two axes, which looks
+    plausible on a level drone and is wrong the moment it banks.
+    """
+    src = _driver_src()
+    assert "pitch_d, yaw_d, roll_d" in src, \
+        "mpry must be unpacked as (pitch, yaw, roll) per the SDK"
+
+
+def test_mission_pad_axis_signs_are_configurable_not_hardcoded():
+    """The SDK documents the pad origin and plane but not the axis signs, so
+    they must be a parameter the user can verify, like speed_to_mps."""
+    src = _driver_src()
+    assert "mission_pad_axis_signs" in src
+    assert "p('mission_pad_axis_signs'" in src, "must be a declared parameter"
+
+
+def test_mission_pad_conversion_arithmetic():
+    """Reproduce the driver's conversion and check a concrete case."""
+    signs = np.array([1.0, -1.0, 1.0])
+    raw_cm = np.array([50, 30, 80], dtype=float)     # 50 cm fwd, 30 right, 80 up
+    pos = raw_cm / 100.0 * signs
+    # Forward stays positive; the SDK's right-positive y becomes ROS left-positive.
+    assert np.isclose(pos[0], 0.50)
+    assert np.isclose(pos[1], -0.30)
+    assert np.isclose(pos[2], 0.80)

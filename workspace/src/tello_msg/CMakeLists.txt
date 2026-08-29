@@ -27,6 +27,7 @@ set(msg_files
   "msg/TelloStatus.msg"
   "msg/TelloID.msg"
   "msg/TelloWifiConfig.msg"
+  "msg/TelloMissionPad.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

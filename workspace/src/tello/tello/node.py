@@ -56,7 +56,7 @@ import rclpy
 import tf2_ros
 import yaml
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import TransformStamped, Twist
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -74,7 +74,8 @@ except ModuleNotFoundError as e:
         "or inside your venv, then rebuild/re-source your workspace."
     ) from e
 
-from tello_msg.msg import TelloID, TelloStatus, TelloWifiConfig
+from tello_msg.msg import (TelloID, TelloMissionPad, TelloStatus,
+                          TelloWifiConfig)
 
 # djitellopy logs every rc packet at INFO, which at 20 Hz drowns the console.
 logging.getLogger("djitellopy").setLevel(logging.WARNING)
@@ -120,6 +121,21 @@ class TelloNode:
         p('telemetry_poll_hz', 50.0)
         p('speed_to_mps', 0.1)
         p('publish_bgr', True)
+        # ---- Mission Pads: the Tello's own absolute position reference ----
+        # Tello EDU / RoboMaster TT only (SDK 2.0+). Enabling this on a
+        # standard Tello is harmless -- the command is rejected and the driver
+        # reports PAD_UNSUPPORTED rather than pretending.
+        p('mission_pad_enable', False)
+        # 0 = downward only (20 Hz), 1 = forward only (20 Hz), 2 = both (10 Hz).
+        # Downward-only is the right choice for ground truth: the pad lies on
+        # the floor, and halving the rate to also watch forward buys nothing.
+        p('mission_pad_direction', 0)
+        # The SDK documents the pad origin and plane but NOT the axis signs.
+        # These multiply (x, y, z) after the cm -> m conversion, so the default
+        # applies the same FRD -> FLU flip as the rest of the SDK's data.
+        # Verify once: put the drone 50 cm forward of the pad centre and check
+        # that position.x reads +0.5.
+        p('mission_pad_axis_signs', [1.0, -1.0, 1.0])
         p('video_stall_timeout', 3.0)
         p('video_auto_restart', True)
 
@@ -138,6 +154,13 @@ class TelloNode:
         self.telemetry_poll_hz = float(g('telemetry_poll_hz'))
         self.speed_to_mps = float(g('speed_to_mps'))
         self.publish_bgr = bool(g('publish_bgr'))
+        self.mission_pad_enable = bool(g('mission_pad_enable'))
+        self.mission_pad_direction = int(g('mission_pad_direction'))
+        self.mission_pad_signs = np.array(
+            [float(v) for v in g('mission_pad_axis_signs')], dtype=float)
+        #: None until probed; True/False once we know whether this airframe
+        #: actually supports mission pads.
+        self._mission_pad_supported = None
         self.video_stall_timeout = max(1.0, float(g('video_stall_timeout')))
         self.video_auto_restart = bool(g('video_auto_restart'))
 
@@ -318,6 +341,8 @@ class TelloNode:
             self._publish_static_camera_tf()
 
         self._cmd_q.put(('identify', ()))
+        if self.mission_pad_enable:
+            self._cmd_q.put(('enable_mission_pads', ()))
         node.get_logger().info('Tello: driver ready')
 
     # ------------------------------------------------------------------ #
@@ -333,6 +358,11 @@ class TelloNode:
         self.pub_odom = n.create_publisher(Odometry, 'odom', qos_profile_sensor_data)
         self.pub_tof = n.create_publisher(Range, 'tof', qos_profile_sensor_data)
         self.pub_status = n.create_publisher(TelloStatus, 'status', 1)
+        self.pub_mission_pad = n.create_publisher(TelloMissionPad, 'mission_pad', 10)
+        # A plain PoseStamped as well, so the pad pose drops straight into
+        # rosbag + evaluate_bag without any consumer needing tello_msg.
+        self.pub_mission_pad_pose = n.create_publisher(
+            PoseStamped, 'mission_pad_pose', 10)
         self.pub_id = n.create_publisher(TelloID, 'id', 1)
         self.pub_battery = n.create_publisher(BatteryState, 'battery', 1)
         self.pub_temperature = n.create_publisher(Temperature, 'temperature', 1)
@@ -401,6 +431,27 @@ class TelloNode:
                          '(harmless: these are identification only)')
             else:
                 log.info(f'Tello SDK {sdk} serial {serial}')
+        elif cmd == 'enable_mission_pads':
+            # Blocking SDK round trips, hence the worker thread. A standard
+            # Tello answers "error"/"unknown command"; we record that as
+            # unsupported instead of retrying forever or crashing.
+            try:
+                self.tello.enable_mission_pads()
+                self.tello.set_mission_pad_detection_direction(
+                    self.mission_pad_direction)
+                self._mission_pad_supported = True
+                names = {0: 'downward only (20 Hz)', 1: 'forward only (20 Hz)',
+                         2: 'both (10 Hz)'}
+                log.info('Mission pads enabled: '
+                         f'{names.get(self.mission_pad_direction, "?")}')
+            except Exception as e:
+                self._mission_pad_supported = False
+                log.warn(
+                    'Mission pads are NOT supported by this drone '
+                    f'({e}). They require a Tello EDU or RoboMaster TT '
+                    'running SDK 2.0+; a standard Tello has no pad detection '
+                    'hardware. Ground truth will need an external reference '
+                    '-- see the README.')
         elif cmd == 'wifi_snr':
             self._wifi_snr = str(self.tello.query_wifi_signal_noise_ratio())
         elif cmd == 'restart_video':
@@ -473,6 +524,7 @@ class TelloNode:
         self._publish_imu(stamp, accel_flu, q)
         self._publish_odom(stamp, vel_flu, q)
         self._publish_tof(stamp, f('tof'))
+        self._publish_mission_pad(stamp, state)
         self._publish_status(stamp, state, accel_frd, vel_frd, roll_d, pitch_d, yaw_d)
 
     @staticmethod
@@ -579,6 +631,74 @@ class TelloNode:
         # rather than being published as a plausible-looking number.
         msg.range = r if msg.min_range <= r <= msg.max_range else float('inf')
         self.pub_tof.publish(msg)
+
+    def _publish_mission_pad(self, stamp, state):
+        """Publish the drone's position relative to a detected Mission Pad.
+
+        This is the Tello's own ABSOLUTE, drift-free position reference, which
+        is precisely what makes it usable as ground truth for VIO error: the
+        pad is fixed in the room, so any disagreement between this and the VIO
+        estimate is VIO error, not a common-mode drift both share.
+
+        The fields only exist in the state string while pad detection is on,
+        so their absence is the normal case and is reported, not treated as an
+        error.
+        """
+        if self.pub_mission_pad.get_subscription_count() == 0 and \
+                self.pub_mission_pad_pose.get_subscription_count() == 0:
+            return
+
+        msg = TelloMissionPad()
+        msg.header.stamp = stamp
+        msg.header.frame_id = 'mission_pad'
+
+        if self._mission_pad_supported is False:
+            msg.pad_id = TelloMissionPad.PAD_UNSUPPORTED
+        elif not self.mission_pad_enable or 'mid' not in state:
+            msg.pad_id = TelloMissionPad.PAD_DISABLED
+        else:
+            try:
+                mid = int(float(state.get('mid', -1)))
+            except (TypeError, ValueError):
+                mid = -1
+            msg.pad_id = mid if mid >= 1 else TelloMissionPad.PAD_NONE
+
+        msg.valid = msg.pad_id >= 1
+        if msg.valid:
+            def i(key):
+                try:
+                    return int(float(state.get(key, 0)))
+                except (TypeError, ValueError):
+                    return 0
+            msg.raw_x_cm, msg.raw_y_cm, msg.raw_z_cm = i('x'), i('y'), i('z')
+            pos = np.array([msg.raw_x_cm, msg.raw_y_cm, msg.raw_z_cm],
+                           dtype=float) / 100.0 * self.mission_pad_signs
+            msg.position.x, msg.position.y, msg.position.z = [float(v) for v in pos]
+
+            # "mpry" is documented as pitch,yaw,roll -- an unusual order that
+            # is easy to mis-read as roll,pitch,yaw. Re-order it here so the
+            # published message is conventional.
+            mp = str(state.get('mpry', '0,0,0')).split(',')
+            try:
+                pitch_d, yaw_d, roll_d = (float(v) for v in mp[:3])
+            except (TypeError, ValueError):
+                pitch_d = yaw_d = roll_d = 0.0
+            msg.rpy.x = roll_d * DEG
+            msg.rpy.y = -pitch_d * DEG
+            msg.rpy.z = -yaw_d * DEG
+
+        self.pub_mission_pad.publish(msg)
+
+        if msg.valid and self.pub_mission_pad_pose.get_subscription_count() > 0:
+            ps = PoseStamped()
+            ps.header = msg.header
+            ps.pose.position = msg.position
+            q = self._attitude_quaternion(
+                np.degrees(msg.rpy.x), -np.degrees(msg.rpy.y),
+                -np.degrees(msg.rpy.z))
+            ps.pose.orientation.x, ps.pose.orientation.y, \
+                ps.pose.orientation.z, ps.pose.orientation.w = q
+            self.pub_mission_pad_pose.publish(ps)
 
     def _publish_status(self, stamp, state, accel_frd, vel_frd, roll, pitch, yaw):
         def i(key):

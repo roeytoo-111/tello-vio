@@ -50,6 +50,15 @@ def generate_launch_description():
                                           'one installed by the orbslam2 package)'),
         DeclareLaunchArgument('use_sim_time', default_value='false',
                               description='Set true when replaying a bag'),
+        DeclareLaunchArgument('mission_pad', default_value='false',
+                              description='Enable Mission Pad detection for '
+                                          'ground truth (Tello EDU / RoboMaster '
+                                          'TT only; a standard Tello reports it '
+                                          'as unsupported and carries on).'),
+        DeclareLaunchArgument('mission_pad_direction', default_value='0',
+                              description='0 = downward only (20 Hz), '
+                                          '1 = forward only (20 Hz), '
+                                          '2 = both (10 Hz).'),
     ]
 
     use_sim_time = {'use_sim_time': LaunchConfiguration('use_sim_time')}
@@ -64,6 +73,8 @@ def generate_launch_description():
             # The driver must NOT publish odom->base_link: tello_vio owns that
             # edge. Two publishers on one TF edge is a broken tree.
             'tf_pub': False,
+            'mission_pad_enable': LaunchConfiguration('mission_pad'),
+            'mission_pad_direction': LaunchConfiguration('mission_pad_direction'),
         }, use_sim_time],
         respawn=False,
     )

@@ -263,6 +263,72 @@ resolution actually being published** — ORB-SLAM2 reads that YAML, not
 
 ## Measuring real accuracy against ground truth
 
+Every accuracy figure in the technical report is **simulated**. To measure this
+estimator on your own drone you need an independent, metric, drift-free
+reference. There are three, and which one you can use depends on your hardware.
+
+| Source | Accuracy | Requires | Notes |
+|---|---|---|---|
+| **Motion capture** (Vicon / OptiTrack) | sub-mm | a mocap lab | What published Tello research uses |
+| **Mission Pads** | ~cm, 10-20 Hz | **Tello EDU / RoboMaster TT** | The Tello's own built-in reference |
+| **ArUco marker** | 1-2 cm at 1-2 m | a printer | Works on any Tello |
+
+Motion capture is the gold standard and is what the literature uses: *VizFlyt*
+evaluates visual odometry on a Tello EDU against Vicon, and *AirCapRL* used a
+Vicon hall specifically because the Tello's own vision-based localisation is
+too inaccurate to trust. If you have access to a mocap lab, use it and publish
+its pose on a topic — `evaluate_bag` takes any `PoseStamped`.
+
+### Which do you have? Ask the drone
+
+```bash
+python3 scripts/probe_drone.py
+```
+
+Raw UDP, no ROS and no build required. It reports the SDK version and tries
+`mon`, then tells you which ground-truth option applies to your airframe.
+
+### Option A: Mission Pads (Tello EDU only, best if you have it)
+
+The Tello EDU's downward camera recognises printed Mission Pads and reports
+the drone's own position relative to the pad centre, in centimetres, at
+10–20 Hz. Because the pad is fixed in the room this is an **absolute,
+drift-free** reference — exactly what VIO lacks, and therefore a genuine error
+measurement rather than two estimates sharing a common drift.
+
+```bash
+ros2 launch tello_vio vio.launch.py rviz:=true mission_pad:=true
+
+ros2 bag record -o flight1 /tello_vio/odom /mission_pad_pose
+ros2 run tello_vio evaluate_bag --ros-args -p bag:=flight1 \
+     -p gt_topic:=/mission_pad_pose -p plot:=err.png
+```
+
+Direction `0` is downward-only, which runs at 20 Hz rather than the 10 Hz you
+get by also watching forward — and the pad is on the floor anyway.
+
+**Verify the axis signs once.** The SDK documents the pad origin and plane but
+not the axis signs. Place the drone 50 cm forward of the pad centre and check
+that `position.x` reads `+0.5`; if a sign is inverted, flip it in
+`mission_pad_axis_signs`. This is the same class of unverified-constant problem
+as `speed_to_mps`, and it is a parameter for the same reason.
+
+**If you have a standard Tello this will not work** — pad detection is EDU/TT
+hardware, SDK 2.0+. The driver detects this and says so rather than silently
+publishing nothing:
+
+```
+Mission pads are NOT supported by this drone. They require a Tello EDU or
+RoboMaster TT running SDK 2.0+ ...
+```
+
+A quick way to tell which you have: if the driver logs *"firmware does not
+support sdk?/sn? queries"*, you are on SDK 1.3 and mission pads are unavailable
+— use Option B.
+
+### Option B: printed ArUco marker (works on any Tello)
+
+
 Every accuracy figure in the technical report is **simulated**. To measure
 this estimator on your own drone you need an independent metric reference.
 Indoors, a printed ArUco marker is the practical option: ~1-2 cm at 1-2 m,
