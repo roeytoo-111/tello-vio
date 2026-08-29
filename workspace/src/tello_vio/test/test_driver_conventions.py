@@ -251,3 +251,47 @@ def test_mission_pad_conversion_arithmetic():
     assert np.isclose(pos[0], 0.50)
     assert np.isclose(pos[1], -0.30)
     assert np.isclose(pos[2], 0.80)
+
+
+# --------------------------------------------------------------------------- #
+# Drone capability probe: reply classification
+# --------------------------------------------------------------------------- #
+
+def _load_probe():
+    """Import scripts/probe_drone.py without it being an installed package."""
+    import importlib.util
+    path = DRIVER.parents[4] / "scripts" / "probe_drone.py"
+    if not path.exists():
+        pytest.skip(f"probe script not found at {path}")
+    spec = importlib.util.spec_from_file_location("probe_drone", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.mark.parametrize("reply", ["ok", "OK", " ok ", "Ok\r\n"])
+def test_probe_accepts_only_the_success_token(reply):
+    assert _load_probe().is_ok(reply) is True
+
+
+@pytest.mark.parametrize("reply", [
+    "error",
+    "unknown command: mon",        # what a standard Tello actually says
+    "unknown command: sdk?",
+    "out of range",
+    "error Not joystick",
+    "error Motor stop",
+    "",
+    None,
+])
+def test_probe_rejects_every_form_of_refusal(reply):
+    """Regression: an 'error'-prefix test classified "unknown command: mon" as
+    SUCCESS and told a standard Tello it supported Mission Pads."""
+    assert _load_probe().is_ok(reply) is False
+
+
+def test_probe_does_not_use_a_prefix_or_substring_test():
+    """Guard the implementation, not just its current outputs."""
+    src = (DRIVER.parents[4] / "scripts" / "probe_drone.py").read_text()
+    assert 'startswith("error")' not in src, "prefix test reintroduced"
+    assert "strip().lower() == \"ok\"" in src, "exact-match test removed"

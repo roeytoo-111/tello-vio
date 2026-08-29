@@ -18,6 +18,23 @@ ADDR = ("192.168.10.1", 8889)
 TIMEOUT = 4.0
 
 
+def is_ok(reply) -> bool:
+    """True only for an accepted command.
+
+    The Tello signals rejection in several ways and ``error`` is only one of
+    them: a standard Tello answers an SDK 2.0 command with
+    ``"unknown command: mon"``. Testing for an ``error`` prefix means every
+    *other* form of rejection reads as SUCCESS -- which is exactly how this
+    probe once told a standard Tello that it supported Mission Pads.
+
+    So: accept exactly the documented success token and treat everything else,
+    including silence, as refusal. Note this is stricter than djitellopy's own
+    ``'ok' in response.lower()`` substring test, which would also accept a
+    reply that merely contains those two letters.
+    """
+    return reply is not None and str(reply).strip().lower() == "ok"
+
+
 def main() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -40,7 +57,7 @@ def main() -> int:
             return f"<socket error: {e}>"
 
     print(f"probing {ADDR[0]} ...\n")
-    if ask("command") is None:
+    if not is_ok(ask("command")):
         print("No response to 'command'.")
         print("  The drone is off, asleep, or this machine is not on its WiFi AP.")
         print("  On WSL2 check that WINDOWS is joined to TELLO-XXXXXX.")
@@ -50,11 +67,12 @@ def main() -> int:
     sdk = ask("sdk?")
     serial = ask("sn?")
     mon = ask("mon")
-    if mon is not None and not str(mon).lower().startswith("error"):
+    supported = is_ok(mon)
+    if supported:
         ask("moff")          # leave the drone as we found it
 
-    supported = mon is not None and not str(mon).lower().startswith("error")
-    sdk_txt = sdk if sdk else "not supported (=> SDK 1.3, standard Tello)"
+    sdk_txt = sdk if is_ok(sdk) or (sdk and "unknown" not in sdk.lower()) \
+        else f"{sdk or 'no reply'}  (=> SDK 1.3, standard Tello)"
 
     print(f"  SDK version   : {sdk_txt}")
     print(f"  serial number : {serial if serial else 'not supported'}")

@@ -288,6 +288,11 @@ python3 scripts/probe_drone.py
 Raw UDP, no ROS and no build required. It reports the SDK version and tries
 `mon`, then tells you which ground-truth option applies to your airframe.
 
+A note on how it judges: the Tello signals refusal in several ways, and
+`error` is only one of them — an SDK 1.3 drone answers an SDK 2.0 command with
+`unknown command: mon`. The probe therefore accepts **only** the exact success
+token `ok` and treats everything else, including silence, as refusal.
+
 ### Option A: Mission Pads (Tello EDU only, best if you have it)
 
 The Tello EDU's downward camera recognises printed Mission Pads and reports
