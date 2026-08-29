@@ -41,9 +41,14 @@
     time_offset_s: 0.0                                        # CALIBRATE
 
     # ---- sensor scaling ---------------------------------------------------
-    # vgx/vgy/vgz -> m/s. 0.1 assumes decimetres per second; see
-    # tello_vio/tello_model.py for why this is a parameter and not a constant.
-    speed_to_mps: 0.1
+    # vgx/vgy/vgz -> m/s. CENTIMETRES per second.
+    #
+    # This sets the metric scale of the whole estimator. Vision is scale-free
+    # by construction, so a wrong value here cannot be corrected by any amount
+    # of visual data -- it just makes the drone appear to fly 10x too fast.
+    # The driver cross-checks it against the height signal during flight and
+    # warns if they disagree.
+    speed_to_mps: 0.01
 
     use_body_velocity: true
     use_barometer: true

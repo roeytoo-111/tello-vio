@@ -83,11 +83,26 @@ class TelloUnits:
         segment that alone integrates to roughly 1 m of position error, on top
         of everything else.
     speed_to_mps:
-        ``vgx/vgy/vgz``. The SDK document gives no unit. Decimetres per second
-        is the reading consistent with the Tello's 8 m/s top speed against
-        observed field magnitudes (~30 at full stick); centimetres per second
-        would cap the drone at 1 m/s, which it plainly exceeds. Set
-        ``0.01`` if your firmware disagrees -- ``imu_calib`` will tell you.
+        ``vgx/vgy/vgz`` -> m/s. **Centimetres per second**, i.e. 0.01.
+
+        This was 0.1 (decimetres/s) on the strength of a community reading,
+        and flight data proved it wrong by a factor of ten. The evidence:
+
+        * The SDK document states a unit for every other speed it defines --
+          ``speed?`` "(cm/s)", ``speed x`` "cm/s", ``go x y z speed`` "(cm/s)".
+          For ``vgx`` it says only "the speed of the x axis", with no unit. The
+          document's own convention for speed is cm/s throughout.
+        * On a real flight the estimator reported a sustained 4.24 m/s while
+          the drone hovered gently in a small room below 0.6 m altitude,
+          running the position estimate 34 m away in 8 s. At cm/s the same
+          telemetry reads 0.42 m/s and 3.4 m -- which is what actually
+          happened.
+
+        This single constant sets the metric scale of the entire estimator:
+        vision is scale-free by construction, so a wrong value here cannot be
+        detected or corrected by any amount of visual data. See
+        ``check_speed_scale`` in the driver, which cross-checks it against the
+        independent height signal in flight.
     baro_to_m:
         ``djitellopy.Tello.get_barometer()`` already multiplies the raw metres
         by 100 and documents its return as centimetres, so the driver divides
@@ -101,7 +116,7 @@ class TelloUnits:
     """
 
     accel_to_mps2: float = G0 / 1000.0
-    speed_to_mps: float = 0.1
+    speed_to_mps: float = 0.01
     baro_to_m: float = 1.0
     tof_to_m: float = 1.0
     tof_min_m: float = 0.10

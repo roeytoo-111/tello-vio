@@ -119,7 +119,7 @@ class TelloNode:
         p('rc_rate_hz', 20.0)
         p('rc_timeout_sec', 0.35)
         p('telemetry_poll_hz', 50.0)
-        p('speed_to_mps', 0.1)
+        p('speed_to_mps', 0.01)
         p('publish_bgr', True)
         # ---- Mission Pads: the Tello's own absolute position reference ----
         # Tello EDU / RoboMaster TT only (SDK 2.0+). Enabling this on a
@@ -304,6 +304,9 @@ class TelloNode:
         self._next_restart_t = 0.0
         self._identity = None
         self._wifi_snr = ''
+        # Rolling evidence for the speed-scale self-check (see _check_speed_scale).
+        self._scale_hist = []
+        self._scale_verdict = None
 
         # Blocking SDK commands run here, never on an executor thread.
         self._cmd_q: "queue.Queue" = queue.Queue()
@@ -525,6 +528,7 @@ class TelloNode:
         self._publish_odom(stamp, vel_flu, q)
         self._publish_tof(stamp, f('tof'))
         self._publish_mission_pad(stamp, state)
+        self._check_speed_scale(time.time(), f('vgz'), f('h') / 100.0)
         self._publish_status(stamp, state, accel_frd, vel_frd, roll_d, pitch_d, yaw_d)
 
     @staticmethod
@@ -631,6 +635,69 @@ class TelloNode:
         # rather than being published as a plausible-looking number.
         msg.range = r if msg.min_range <= r <= msg.max_range else float('inf')
         self.pub_tof.publish(msg)
+
+    def _check_speed_scale(self, t, vgz_raw, height_m):
+        """Cross-check speed_to_mps against the independent height signal.
+
+        ``vgz`` and ``h`` come from the same drone but are different
+        quantities: one is the flow sensor's velocity estimate, the other a
+        height. Integrating the first must reproduce a change in the second.
+        If it does not, the unit assumed for ``vg*`` is wrong.
+
+        This check exists because that unit WAS wrong -- 0.1 instead of 0.01 --
+        and nothing caught it. Vision cannot: it is scale-free by construction,
+        so a 10x velocity error produces a perfectly self-consistent estimate
+        of a drone flying 10x too fast. The only way to catch it on-board is to
+        compare two metric signals against each other, which is what this does.
+
+        Deliberately advisory: it prints the evidence and the implied scale
+        rather than silently applying a correction, because a self-tuning
+        scale factor would hide exactly the kind of fault it exists to find.
+        """
+        if self._scale_verdict is not None:
+            return
+        self._scale_hist.append((t, vgz_raw, height_m))
+        # Keep a 3 s window.
+        while self._scale_hist and t - self._scale_hist[0][0] > 3.0:
+            self._scale_hist.pop(0)
+        if len(self._scale_hist) < 12:
+            return
+
+        t0, _, h0 = self._scale_hist[0]
+        t1, _, h1 = self._scale_hist[-1]
+        dh = h1 - h0
+        # Only judge on a climb or descent big enough to dwarf the height
+        # signal's own decimetre quantisation.
+        if abs(dh) < 0.30:
+            return
+
+        # Trapezoidal integral of the reported vertical speed over the window.
+        integral = 0.0
+        for (ta, va, _), (tb, vb, _) in zip(self._scale_hist, self._scale_hist[1:]):
+            integral += 0.5 * (va + vb) * (tb - ta)
+        if abs(integral) < 1e-6:
+            return
+
+        implied = dh / integral          # the scale that WOULD reconcile them
+        ratio = implied / max(1e-9, self.speed_to_mps)
+        self._scale_verdict = implied
+
+        log = self.node.get_logger()
+        if 0.5 < ratio < 2.0:
+            log.info(
+                f'speed_to_mps sanity check OK: height changed {dh:+.2f} m and '
+                f'the integrated vertical speed agrees within {abs(1-ratio)*100:.0f} %.')
+        else:
+            log.error(
+                f'speed_to_mps LOOKS WRONG by about {ratio:.1f}x.\n'
+                f'  Over {t1-t0:.1f} s the height changed {dh:+.2f} m, but the '
+                f'integrated vgz says {integral*self.speed_to_mps:+.2f} m.\n'
+                f'  Implied speed_to_mps = {implied:.4f} (currently '
+                f'{self.speed_to_mps}).\n'
+                '  This sets the METRIC SCALE of the whole estimator, and vision '
+                'cannot correct it -- the drone will appear to fly at the wrong '
+                'speed and the position will run away. Fix it before trusting '
+                'any distance.')
 
     def _publish_mission_pad(self, stamp, state):
         """Publish the drone's position relative to a detected Mission Pad.

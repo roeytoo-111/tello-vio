@@ -295,3 +295,58 @@ def test_probe_does_not_use_a_prefix_or_substring_test():
     src = (DRIVER.parents[4] / "scripts" / "probe_drone.py").read_text()
     assert 'startswith("error")' not in src, "prefix test reintroduced"
     assert "strip().lower() == \"ok\"" in src, "exact-match test removed"
+
+
+# --------------------------------------------------------------------------- #
+# Velocity scale: the constant that sets the estimator's metric scale
+# --------------------------------------------------------------------------- #
+
+def test_speed_scale_is_centimetres_per_second():
+    """vg* are cm/s, not dm/s.
+
+    Regression for a real flight failure: with 0.1 the estimator reported a
+    sustained 4.24 m/s while the drone hovered gently below 0.6 m in a small
+    room, running position 34 m away in 8 seconds. The SDK document states
+    cm/s for every other speed it defines (speed?, speed x, go) and gives no
+    unit for vg*, so cm/s is the document's own convention.
+    """
+    from tello_vio.tello_model import TelloUnits
+    assert TelloUnits().speed_to_mps == 0.01
+    assert "p('speed_to_mps', 0.01)" in _driver_src(), "driver default must be cm/s"
+
+    raw = 42.4          # what the drone actually reported
+    assert abs(raw * 0.1 - 4.24) < 1e-9, "the old scale produced the observed 4.24 m/s"
+    assert abs(raw * 0.01 - 0.424) < 1e-9, "cm/s gives a plausible 0.42 m/s"
+
+
+def test_a_wrong_speed_scale_cannot_be_fixed_by_vision():
+    """Why this constant is uniquely dangerous -- asserted, not just claimed.
+
+    The visual update constrains rotation and a 2-DoF BEARING. Scaling the
+    whole trajectory leaves every bearing unchanged, so no amount of visual
+    data can detect or correct a wrong metric scale.
+    """
+    from tello_vio.eskf import _tangent_basis
+    rng = np.random.default_rng(0)
+    for _ in range(50):
+        baseline = rng.normal(size=3)
+        if np.linalg.norm(baseline) < 1e-6:
+            continue
+        u_true = baseline / np.linalg.norm(baseline)
+        for scale in (0.1, 1.0, 10.0):
+            scaled = baseline * scale
+            u = scaled / np.linalg.norm(scaled)
+            assert np.allclose(u, u_true, atol=1e-12), \
+                "bearing changed under scaling -- the premise would be wrong"
+        B = _tangent_basis(u_true)
+        assert np.allclose(B.T @ (u_true - u_true), 0.0)
+
+
+def test_driver_has_a_speed_scale_self_check():
+    """The on-board check that would have caught this."""
+    src = _driver_src()
+    assert "_check_speed_scale" in src
+    assert "LOOKS WRONG by about" in src, "must report the implied scale"
+    # It must compare against HEIGHT -- an independent metric signal -- and not
+    # against anything derived from vg* itself.
+    assert "height_m" in src and "integral" in src

@@ -123,7 +123,7 @@ class VioNode(Node):
         p("time_offset_s", 0.0)
 
         # Sensor scaling (see tello_model.TelloUnits for why these are knobs).
-        p("speed_to_mps", 0.1)
+        p("speed_to_mps", 0.01)
         p("use_body_velocity", True)
         p("use_barometer", True)
         p("use_tof", True)
@@ -657,14 +657,37 @@ class VioNode(Node):
             sig = float(np.linalg.norm(np.sqrt(np.diag(self.kf.P[0:3, 0:3]))))
             vis = self.kf.stats.get("visual", [0, 0, 0.0])
             vrot = self.kf.stats.get("visual_rot", [0, 0, 0.0])
+            stats = {k: list(v) for k, v in self.kf.stats.items()}
         ok = vis[0] + vrot[0]
         rej = vis[1] + vrot[1]
         vo = self.frontend.last_status if self.frontend is not None else "no camera_info"
+
+        # Every measurement kind, not just vision. The first flight failure was
+        # driven by the BODY VELOCITY update injecting a 10x-too-fast reading,
+        # and this line reported only the visual counters -- so the log showed a
+        # healthy front-end while the estimator was being steered off a cliff by
+        # a different sensor entirely. Print them all.
+        parts = []
+        for kind in ("vel_body", "attitude", "baro", "tof", "zupt"):
+            a, r, _ = stats.get(kind, [0, 0, 0.0])
+            if a or r:
+                parts.append(f"{kind} {a}/{a+r}")
+        aiding = "  ".join(parts) if parts else "none"
+
         self.get_logger().info(
             f"VIO: p=[{pos[0]:+.2f} {pos[1]:+.2f} {pos[2]:+.2f}]m "
             f"(σ {sig:.2f}) |v|={speed:.2f}m/s | vo: {vo} | "
-            f"visual updates {ok} ok / {rej} rejected | "
+            f"visual {ok} ok / {rej} rej | aiding accepted: {aiding} | "
             f"imgs={self._n_images} telem={self._n_telemetry}")
+
+        # A Tello cannot exceed 8 m/s, and indoors anything past ~2 m/s means
+        # the metric scale is wrong rather than the drone being fast.
+        if speed > 2.0:
+            self.get_logger().warn(
+                f"|v| = {speed:.1f} m/s is implausible indoors. The usual cause "
+                "is speed_to_mps being wrong, which sets the metric scale of "
+                "the whole estimator and cannot be corrected by vision.",
+                throttle_duration_sec=5.0)
 
     def on_diagnostics(self) -> None:
         with self.lock:
