@@ -279,6 +279,26 @@ Vicon hall specifically because the Tello's own vision-based localisation is
 too inaccurate to trust. If you have access to a mocap lab, use it and publish
 its pose on a topic — `evaluate_bag` takes any `PoseStamped`.
 
+### What you need besides the drone
+
+Two sheets of A4, printed from **[`docs/print/tello_vio_print_targets.pdf`](docs/print/tello_vio_print_targets.pdf)**:
+
+| Page | What for |
+|---|---|
+| 1 | ArUco marker, 150 mm — ground truth |
+| 2 | 9x7 checkerboard, 25 mm squares — camera calibration |
+
+Plus a **ruler** and some **tape**. Nothing else: no motion capture, no extra
+sensors, no Tello EDU.
+
+Print at **100 % scale** with "fit to page" / "shrink to fit" turned OFF, then
+**measure the printed target with the ruler**. Both pages carry a printed mm
+scale so you can check the print in place. Printers routinely scale by a few
+percent, and that error passes straight into every metric result — so pass
+what you actually measure, not the nominal size.
+
+Regenerate with `python3 docs/make_print_targets.py`.
+
 ### Which do you have? Ask the drone
 
 ```bash
