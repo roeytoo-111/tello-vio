@@ -28,6 +28,9 @@ setup(
             'imu_calib = tello_vio.nodes.imu_calib_node:main',
             'camera_imu_calib = tello_vio.nodes.camera_imu_calib_node:main',
             'map_align = tello_vio.nodes.map_align_node:main',
+            'ground_truth = tello_vio.nodes.ground_truth_node:main',
+            'make_marker = tello_vio.nodes.make_marker_node:main',
+            'evaluate_bag = tello_vio.nodes.evaluate_bag:main',
         ],
     },
 )

@@ -261,6 +261,67 @@ resolution actually being published** — ORB-SLAM2 reads that YAML, not
 
 ---
 
+## Measuring real accuracy against ground truth
+
+Every accuracy figure in the technical report is **simulated**. To measure
+this estimator on your own drone you need an independent metric reference.
+Indoors, a printed ArUco marker is the practical option: ~1-2 cm at 1-2 m,
+using the same camera the estimator uses.
+
+**1. Print a marker and measure it.**
+
+```bash
+ros2 run tello_vio make_marker --ros-args -p output:=marker.png
+```
+
+Print at 100 % scale (turn off "fit to page"), tape it to a wall, then measure
+the black square with a ruler. That measurement sets the scale of every number
+that follows -- printers routinely scale by a few percent, and that error
+passes straight into your results.
+
+**2. Fly with ground truth running**, keeping the marker in view:
+
+```bash
+ros2 launch tello_vio vio.launch.py rviz:=true
+ros2 run tello_vio ground_truth --ros-args -p marker_size_m:=0.195
+ros2 bag record -o flight1 /tello_vio/odom /tello_ground_truth/pose
+```
+
+**3. Score the flight:**
+
+```bash
+ros2 run tello_vio evaluate_bag --ros-args -p bag:=flight1 -p plot:=err.png
+```
+
+You get ATE, RPE, drift as a percentage of path length, and a three-panel plot
+(trajectory top-down, per-axis, error over time).
+
+### Reading the two ATE numbers
+
+The report prints ATE twice, and the gap between them is the diagnostic:
+
+| | meaning |
+|---|---|
+| **ATE (SE3)** | scale forced to 1 -- holds the estimator to its claim of real metres |
+| **ATE (Sim3)** | scale also fitted, and reported |
+
+If Sim3 error is much lower than SE3, the trajectory **shape** is right and the
+**scale** is wrong. That points at calibration -- `speed_to_mps`, camera
+intrinsics -- not at the filter. The tool says so explicitly when it detects it.
+
+### Limits of this reference
+
+Fiducial **translation** is accurate at any viewing angle (~1.5 cm measured).
+Fiducial **rotation** is not, when the marker is viewed head-on: four coplanar
+corners barely constrain tilt, so two orientations fit almost equally well.
+Measured on noise-free renders at 2 m: 7.3 deg error head-on versus 1.8 deg at
+15-45 deg obliquity. Because camera-in-marker position depends on that
+rotation, 7 deg at 2 m becomes ~25 cm of apparent position error.
+
+The node therefore reports an `ambiguity` metric per detection and refuses to
+publish a pose when it is high. Mount the marker so the drone views it at an
+angle, and prefer flights where it stays large in frame.
+
 ## Troubleshooting
 
 **`ros2 topic list` / `rqt` hangs forever (WSL2).** The `ros2` daemon fails to
