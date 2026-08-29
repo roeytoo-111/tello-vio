@@ -353,6 +353,24 @@ support sdk?/sn? queries"*, you are on SDK 1.3 and mission pads are unavailable
 
 ### Option B: printed ArUco marker (works on any Tello)
 
+![Ground-truth setup](docs/figures/ground_truth_setup.png)
+
+**The idea in one line:** the marker is bolted to the room, so the position
+derived from it never drifts — while VIO, which integrates motion, does. The
+gap between the two *is* the error.
+
+**The physical setup:** tape the marker flat on a wall at roughly the height
+the drone will fly (~1.2 m — the Tello's camera looks *forward*, not down),
+then fly in the band **1.0–2.5 m** in front of it. That range is set by pixels,
+not by preference: a 150 mm marker spans 138 px at 1 m and only 55 px at 2.5 m,
+and detection gives out below ~40 px.
+
+**Fly an arc rather than straight in and out.** An arc keeps the marker in
+frame while continuously changing the viewing angle, which is what resolves the
+planar rotation ambiguity. A 2 × 2 m volume is plenty — you are measuring drift
+*rate*, not distance covered.
+
+
 
 Every accuracy figure in the technical report is **simulated**. To measure
 this estimator on your own drone you need an independent metric reference.
