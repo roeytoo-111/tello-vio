@@ -156,7 +156,7 @@ class TelloNode:
         self.publish_bgr = bool(g('publish_bgr'))
         self.mission_pad_enable = bool(g('mission_pad_enable'))
         self.mission_pad_direction = int(g('mission_pad_direction'))
-        self.mission_pad_signs = np.array(
+        self.mission_pad_signs = numpy.array(
             [float(v) for v in g('mission_pad_axis_signs')], dtype=float)
         #: None until probed; True/False once we know whether this airframe
         #: actually supports mission pads.
@@ -671,7 +671,7 @@ class TelloNode:
                 except (TypeError, ValueError):
                     return 0
             msg.raw_x_cm, msg.raw_y_cm, msg.raw_z_cm = i('x'), i('y'), i('z')
-            pos = np.array([msg.raw_x_cm, msg.raw_y_cm, msg.raw_z_cm],
+            pos = numpy.array([msg.raw_x_cm, msg.raw_y_cm, msg.raw_z_cm],
                            dtype=float) / 100.0 * self.mission_pad_signs
             msg.position.x, msg.position.y, msg.position.z = [float(v) for v in pos]
 
@@ -694,8 +694,8 @@ class TelloNode:
             ps.header = msg.header
             ps.pose.position = msg.position
             q = self._attitude_quaternion(
-                np.degrees(msg.rpy.x), -np.degrees(msg.rpy.y),
-                -np.degrees(msg.rpy.z))
+                numpy.degrees(msg.rpy.x), -numpy.degrees(msg.rpy.y),
+                -numpy.degrees(msg.rpy.z))
             ps.pose.orientation.x, ps.pose.orientation.y, \
                 ps.pose.orientation.z, ps.pose.orientation.w = q
             self.pub_mission_pad_pose.publish(ps)

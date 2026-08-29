@@ -261,6 +261,61 @@ resolution actually being published** — ORB-SLAM2 reads that YAML, not
 
 ---
 
+## Flying the drone
+
+`vio.launch.py` starts the keyboard control GUI by default. **Click the "Tello"
+window first** — keys go to the focused window, so typing into the terminal
+does nothing. That is the single most common reason "the controls don't work".
+
+| Key | Action |
+|---|---|
+| `T` | take off |
+| `L` | land |
+| `E` | **emergency — cuts the motors instantly.** The drone falls. |
+| `F` | flip forward |
+| arrow keys | move left / right / forward / back |
+| `W` / `S` | up / down |
+| `A` / `D` | yaw left / right |
+
+Controls are **held only while a key is pressed**: the driver zeroes the sticks
+if it hears nothing for 0.35 s, so the drone stops on its own if the GUI
+freezes or you let go. That dead-man is deliberate — the Tello otherwise
+latches the last command indefinitely.
+
+Fly with `control:=false` to disable the GUI (for bag replay, or when flying
+from your own node).
+
+### Flying from your own code
+
+The REP-103 topic is `/cmd_vel` — `+x` forward, `+y` left, `+z` up, `+yaw`
+counter-clockwise, each in [-1, 1]:
+
+```bash
+ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist \
+  '{linear: {x: 0.3}, angular: {z: 0.0}}'
+```
+
+Publish at 10 Hz or faster or the dead-man will keep zeroing it. Take off and
+land are `std_msgs/Empty`:
+
+```bash
+ros2 topic pub --once /takeoff std_msgs/msg/Empty
+ros2 topic pub --once /land    std_msgs/msg/Empty
+```
+
+There is also a legacy `/control` topic using the older stick convention
+(`linear.x` = lateral, `linear.y` = forward, range ±100). It is what
+`tello_control` publishes; prefer `/cmd_vel` for new code.
+
+### Before the first flight
+
+- Clear a 2 x 2 m space, nothing overhead, no curtains or pets.
+- Fly over a **textured floor** — the Tello's downward flow sensor holds
+  position, and it fails over plain carpet or a shiny surface, which makes the
+  drone drift regardless of what this software does.
+- Keep a hand near `L` (land) and know that `E` cuts the motors.
+- Battery below ~20 % makes the Tello refuse to take off.
+
 ## Measuring real accuracy against ground truth
 
 Every accuracy figure in the technical report is **simulated**. To measure this

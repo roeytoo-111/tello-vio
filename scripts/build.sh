@@ -53,12 +53,51 @@ else
   echo " - ORB-SLAM2 not present; the orbslam2 node will be skipped"
 fi
 
+# Static analysis before building. py_compile only checks SYNTAX, so an
+# undefined name (e.g. `np.` where the module imports `numpy`) sails through
+# it, installs cleanly, and raises NameError at runtime on the drone. pyflakes
+# catches that without importing the module, which matters because the ROS
+# nodes cannot be imported outside a ROS context.
+if python3 -c "import pyflakes" 2>/dev/null; then
+  echo " - Static analysis (pyflakes)"
+  PYFILES=$(find "${REPO}/workspace/src" "${REPO}/scripts" "${REPO}/docs" \
+      -name '*.py' -not -path '*/build/*' -not -path '*/install/*' \
+      -not -path '*/__pycache__/*' 2>/dev/null)
+  if [[ -n "${PYFILES}" ]]; then
+    # shellcheck disable=SC2086
+    if ! python3 -m pyflakes ${PYFILES}; then
+      echo " ! pyflakes reported problems (see above). Fix them before flying:" >&2
+      echo " !   an undefined name here becomes a crash on the drone." >&2
+      exit 1
+    fi
+  fi
+else
+  echo " - Skipping static analysis (pip install pyflakes to enable)"
+fi
+
 echo " - Building"
 if [[ -n "${PACKAGES}" ]]; then
   # shellcheck disable=SC2086
   colcon build --symlink-install --packages-select ${PACKAGES}
 else
   colcon build --symlink-install
+fi
+
+# Construct the driver against a stub drone. py_compile and pyflakes both pass
+# on code that raises at RUNTIME (a bad attribute, a wrong constructor arg), and
+# the ROS nodes cannot be imported inside the normal pytest run because ROS's
+# pytest plugins conflict with pytest 9. Running it here, after the build and
+# with the workspace sourced, is the one place this check fits.
+if [[ -f "${REPO}/install/setup.bash" ]]; then
+  echo " - Driver construction check"
+  # shellcheck disable=SC1091
+  ( ros_source "${REPO}/install/setup.bash"
+    if ! python3 "${REPO}/scripts/driver_ctor_check.py" > /tmp/ctor_check.log 2>&1; then
+      echo " ! Driver failed to construct. It would die on launch:" >&2
+      tail -15 /tmp/ctor_check.log >&2
+      exit 1
+    fi
+    echo "   OK" ) || exit 1
 fi
 
 echo

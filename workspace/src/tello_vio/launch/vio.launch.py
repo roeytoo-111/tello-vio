@@ -41,6 +41,10 @@ def generate_launch_description():
         DeclareLaunchArgument('driver', default_value='true',
                               description='Launch the Tello driver (false for bag replay)'),
         DeclareLaunchArgument('rviz', default_value='false'),
+        DeclareLaunchArgument('control', default_value='true',
+                              description='Keyboard control GUI. Its OpenCV '
+                                          'window must have FOCUS for keys to '
+                                          'register - the terminal will not do.'),
         DeclareLaunchArgument('slam', default_value='false',
                               description='Also run ORB-SLAM2 + map_align'),
         DeclareLaunchArgument('vocabulary', default_value='',
@@ -84,6 +88,13 @@ def generate_launch_description():
         parameters=[LaunchConfiguration('config'), use_sim_time],
     )
 
+    control = Node(
+        package='tello_control', executable='tello_control', name='control',
+        output='screen', respawn=False,
+        condition=IfCondition(LaunchConfiguration('control')),
+        parameters=[use_sim_time],
+    )
+
     slam_group = GroupAction(
         condition=IfCondition(LaunchConfiguration('slam')),
         actions=[
@@ -111,4 +122,4 @@ def generate_launch_description():
         parameters=[use_sim_time],
     )
 
-    return LaunchDescription(args + [driver, vio, slam_group, rviz])
+    return LaunchDescription(args + [driver, vio, control, slam_group, rviz])

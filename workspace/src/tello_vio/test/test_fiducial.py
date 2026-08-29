@@ -46,7 +46,6 @@ def render_marker(R_cm, t_cm, marker_px=700, size_m=SIZE):
 
     # Tile pixel -> marker metres (tile spans the marker plus its quiet zone).
     span = size_m * (marker_px + 2 * pad) / marker_px
-    s = span / tile.shape[0]
     src = np.float32([[0, 0], [tile.shape[1], 0],
                       [tile.shape[1], tile.shape[0]], [0, tile.shape[0]]])
     obj = np.array([[-span / 2,  span / 2, 0], [ span / 2,  span / 2, 0],

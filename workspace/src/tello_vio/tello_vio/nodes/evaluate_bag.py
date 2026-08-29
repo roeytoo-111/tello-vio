@@ -13,8 +13,6 @@ trajectory top-down, per-axis position, and position error over time.
 
 from __future__ import annotations
 
-import sys
-
 import numpy as np
 
 

@@ -43,7 +43,7 @@ from tf2_ros import TransformBroadcaster
 
 from .. import lie
 from ..fiducial import (detect_markers, estimate_marker_pose, make_detector)
-from ..ros_utils import make_transform, quat_to_ros, sec_to_stamp, stamp_to_sec
+from ..ros_utils import make_transform, quat_to_ros
 
 try:
     from cv_bridge import CvBridge

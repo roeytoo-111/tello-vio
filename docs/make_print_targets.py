@@ -13,7 +13,6 @@ import cv2
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 
 HERE = os.path.dirname(os.path.abspath(__file__))
