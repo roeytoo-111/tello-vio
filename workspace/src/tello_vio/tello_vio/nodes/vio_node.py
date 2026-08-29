@@ -207,6 +207,10 @@ class VioNode(Node):
         self.stationary = StationarityDetector(self.noise)
 
         self.buffer: deque = deque()
+        #: Most recent telemetry sample folded into the filter. Held across
+        #: calls so the residual interval between the last telemetry sample and
+        #: an image time can be propagated with a zero-order hold.
+        self._last_sample = None
         self.buffer_span = float(g("telemetry_buffer_s"))
         self.last_fused_t = None
         self.have_camera_info = False
@@ -283,6 +287,14 @@ class VioNode(Node):
         self._latest_tof = None
         self._latest_status = None
 
+        if abs(self.time_offset) < 1e-9:
+            self.get_logger().warn(
+                "time_offset_s is 0, i.e. UNCALIBRATED. Tello video lands "
+                "150-350 ms after capture, so visual measurements are being "
+                "associated with inertial states from that much later. Run "
+                "'ros2 launch tello_vio calibrate.launch.py target:=camera_imu' "
+                "and set the result -- until then, treat the trajectory as "
+                "qualitative.")
         self.get_logger().info(
             "tello_vio ready | frames %s -> %s -> %s | t_d=%.3fs | VO %s"
             % (self.odom_frame, self.body_frame, self.camera_frame,
@@ -398,12 +410,15 @@ class VioNode(Node):
         use_att = bool(gp("use_attitude").value)
         use_zupt = bool(gp("use_zupt").value)
 
+        newest_telemetry = self.buffer[-1].t if self.buffer else None
+
         for s in list(self.buffer):
             if s.t <= self.last_fused_t or s.t > t_target:
                 continue
             dt = s.t - self.last_fused_t
             self.kf.propagate(s.accel, s.gyro, dt)
             self.last_fused_t = s.t
+            self._last_sample = s
 
             if use_att:
                 self.kf.update_attitude(s.quat, self.noise.att_rp_std,
@@ -423,6 +438,32 @@ class VioNode(Node):
             if use_tof and s.tof is not None:
                 self.kf.update_tof(s.tof, self.noise.tof_std)
 
+        # ---- residual interval ------------------------------------------
+        # Telemetry arrives at 10 Hz but images at ~28 Hz (both measured on
+        # hardware), so an image time almost never coincides with a telemetry
+        # sample: replaying buffered samples alone leaves the state a mean of
+        # 49 ms -- and up to 99 ms -- behind the image it is about to be
+        # compared against. At 0.5 m/s that is 2.5 cm of un-modelled motion
+        # injected into every visual update, and it also means the published
+        # odometry carries a stamp it is not actually valid at.
+        #
+        # Close the gap with a zero-order hold on the last IMU sample, which
+        # is what the propagation model already assumes between samples.
+        #
+        # The clamp matters: t_target must never run AHEAD of the newest
+        # buffered telemetry, or the next telemetry sample to arrive would be
+        # older than last_fused_t and get silently dropped by the loop above.
+        # With time_offset uncalibrated (0), image stamps are arrival times and
+        # DO run ahead, so the clamp simply disables this refinement -- no
+        # regression, and one more reason to calibrate t_d.
+        if self._last_sample is not None and newest_telemetry is not None:
+            reach = min(t_target, newest_telemetry)
+            dt = reach - self.last_fused_t
+            if 0.0 < dt <= self.kf.cfg.max_dt:
+                self.kf.propagate(self._last_sample.accel,
+                                  self._last_sample.gyro, dt)
+                self.last_fused_t = reach
+
     def on_image(self, msg: Image) -> None:
         if not self.have_camera_info or self.frontend is None or not self.vo_enable:
             return
@@ -438,6 +479,11 @@ class VioNode(Node):
         with self.lock:
             if not self.kf.initialised:
                 return
+            # Advance BEFORE forming the prior. Doing it afterwards (as this
+            # did) built the keyframe trigger's rotation prior from the
+            # attitude at the PREVIOUS image, one frame stale, which biases
+            # the parallax measurement the trigger exists to make.
+            self._advance_to(t_img)
             # Rotation prior for the keyframe trigger, from the current attitude
             # relative to the cloned keyframe attitude. Free, and it is what
             # makes the trigger measure parallax rather than total pixel flow.
@@ -463,6 +509,7 @@ class VioNode(Node):
             return
 
         with self.lock:
+            # Fold in any telemetry that landed while the front-end ran.
             self._advance_to(t_img)
             if meas is not None:
                 self._last_meas = meas
