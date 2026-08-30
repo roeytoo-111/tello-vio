@@ -316,6 +316,55 @@ There is also a legacy `/control` topic using the older stick convention
 - Keep a hand near `L` (land) and know that `E` cuts the motors.
 - Battery below ~20 % makes the Tello refuse to take off.
 
+## Seeing the trajectory
+
+Three ways, in increasing order of effort. None of them needs a ground-truth
+reference.
+
+**Live, in 3D — RViz.** The estimator publishes `nav_msgs/Path` on
+`/tello_vio/path`, and the shipped config already displays it alongside the
+odometry arrow, the TF tree and the tracked features:
+
+```bash
+ros2 launch tello_vio vio.launch.py rviz:=true
+```
+
+The path is capped at `path_max_poses` and only serialised when something is
+subscribed, so leaving RViz closed costs nothing.
+
+**A figure, from a recorded flight.** Record, then plot:
+
+```bash
+ros2 bag record -o flight1 /tello_vio/odom /tello/odom /tello/tof
+```
+
+```bash
+ros2 run tello_vio plot_bag --ros-args -p bag:=flight1 -p plot:=flight1.png
+```
+
+**A figure, without recording.** Same node with no `bag` parameter subscribes
+live and writes the figure when you press Ctrl-C:
+
+```bash
+ros2 run tello_vio plot_bag --ros-args -p plot:=flight.png
+```
+
+Six panels: top-down path coloured by time, a 3D view, per-axis position with
+the filter's own ±1σ envelope, height against the **independent** ToF and
+barometer signals, speed, and how the uncertainty grows. Overlaying
+`/tello/odom` — the driver's telemetry-only dead reckoning — shows what vision
+is actually contributing, since that trace is what you would have without it.
+
+It also prints the numbers you can defend without a reference: path length,
+height range, peak speed, and **net displacement**. That last one matters —
+take off and land on the same spot and the start-to-end distance *is* the
+accumulated drift. It is the one honest error figure available with no
+external reference, so fly closed loops when you want a number.
+
+A peak speed above 2 m/s indoors is not a real motion; the summary says so
+explicitly, because that is the signature of the scale fault described in
+Section 12 of the technical report.
+
 ## Measuring real accuracy against ground truth
 
 Every accuracy figure in the technical report is **simulated**. To measure this

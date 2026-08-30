@@ -31,6 +31,7 @@ setup(
             'ground_truth = tello_vio.nodes.ground_truth_node:main',
             'make_marker = tello_vio.nodes.make_marker_node:main',
             'evaluate_bag = tello_vio.nodes.evaluate_bag:main',
+            'plot_bag = tello_vio.nodes.plot_bag:main',
         ],
     },
 )
