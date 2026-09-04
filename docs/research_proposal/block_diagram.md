@@ -52,10 +52,10 @@ flowchart TB
     end
 
     CAM --> DET
-    CAM --> REC
+    DET -- "target region" --> REC
     DET -- "w (px), box noise σw(w)" --> PIN
     REC -- "πk + unknown" --> MIX
-    REC --> DB
+    REC -- "class keys" --> DB
     DB -- "Wk, Lk + spread" --> ASP
     ASP -- "effective Wk(ψ) + variance" --> PIN
     PIN --> MIX

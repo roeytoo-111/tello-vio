@@ -15,6 +15,7 @@ the `tello` driver, `tello_msg` messages, and `tello_control` keyboard GUI in `w
 | File | Contents |
 |---|---|
 | [block_diagram.md](block_diagram.md) | The system block diagrams: proposal pipeline, ROS 2 node graph (hardware and simulation), safety chain, ablation switchboard |
+| [design_rationale.md](design_rationale.md) | Why every diagram and every block: per-block provenance ([P] PDF-mandated / [V] code-verified / [D] design decision), how each is implemented, what exists today — plus the corrections found on self-audit |
 | [implementation_plan.md](implementation_plan.md) | Verified platform baseline, packages/interfaces to build, experiment → module mapping (E1–E6), simulation choice, two-drone infrastructure, quarter plan, risks |
 | [rl_analysis.md](rl_analysis.md) | **Verified finding: the proposal contains no reinforcement-learning method.** What the proposal actually specifies for closed-loop control, and a clearly-marked RL extension design (states / actions / reward / algorithm) in case a learned controller is intended |
 

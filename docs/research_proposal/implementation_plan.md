@@ -182,9 +182,12 @@ Schema per model (keyed to the recognition class names): `model_id`, width / len
 (m), **measurement convention** (props included? arms folded?), manufacturer source URL,
 retrieval date, tolerance. Plus the `unknown` entry returning a broad distribution over all
 sizes (PDF §3.2). The annotation guideline for bounding boxes must state the same convention,
-otherwise Eq. (1) is fed a W that does not match its w — the ~80 mm gap between the Tello's
-98 mm body and its prop-tip span is a ~45% range bias at every distance, larger than the
-effects being measured. Released with the dataset + datasheet (PDF §4.3).
+otherwise Eq. (1) is fed a W that does not match its w. The bias mechanism is exact: Eq. (1)
+is linear in W, so a fractional mismatch between the annotated extent and the table width is
+the same fractional range bias at every distance. For the Tello only the 98 mm body width is
+officially specified; the prop tips extend the visible span beyond it by an amount that is
+**not** in the spec and must be measured when the table is built — which is precisely what the
+per-entry datasheet is for (PDF §4.3). Released with the dataset + datasheet.
 
 ---
 
@@ -227,8 +230,9 @@ Platform-verified additions:
   will be latency-dominated; measure and report per PDF §4.2.
 - **Surrogate gyro noise** (~10 °/s from whole-degree 10 Hz attitude) may swamp the gyro-aiding
   benefit on hardware — this is exactly the PDF's "lower bound" framing; do not oversell.
-- **Yaw free-runs** (no magnetometer, ~13°/min-scale drift regime measured on this repo) —
-  bearing de-rotation must use short-horizon relative rotation, never absolute yaw.
+- **Yaw free-runs** — no magnetometer; the repo's own figure is ~13° RMS over 60 s, measured
+  in its simulation (README, Known limitations) — so bearing de-rotation must use
+  short-horizon relative rotation, never absolute yaw.
 - **Wi-Fi congestion with mocap + two drones + video** in one room: schedule a link budget
   check in Q6 week 1 (the driver's stream auto-restart is a mitigation, not a fix).
 - **No true hardware kill-switch** on a Tello — record the honest equivalents
