@@ -32,6 +32,7 @@ reinforcement learning at all. This paper is the RL source, and it resolves that
 | [block_diagram.md](block_diagram.md) | Six block diagrams: the published approach, the hybrid control decomposition, DDPG internals, the ROS 2 node graph, the behaviour state machine, and the training→deployment path |
 | [rl_specification.md](rl_specification.md) | **The main reference for the RL work**: state, action, reward, algorithm, hyperparameters, episode structure — what the paper specifies, what it leaves undefined, and a concrete recommended specification for each gap |
 | [implementation_plan.md](implementation_plan.md) | ROS 2 packages and interfaces, mapping onto the existing `workspace/src` baseline, training and deployment phases, evaluation protocol, risks |
+| [drl_ros2_reference_analysis.md](drl_ros2_reference_analysis.md) | Verified read of the `reiniscimurs/DRL-Robot-Navigation-ROS2` reference codebase: which methods transfer to the Tello and which cannot, two empirically-confirmed defects not to copy, and the consequences of **both drones being Tellos** — including the verified finding that the paper's box-ratio thresholds are unsafe at Tello scale |
 
 ## Why this paper fits this repository unusually well
 
