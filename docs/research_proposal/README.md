@@ -1,5 +1,16 @@
 # Research Proposal — Baseline Architecture & Implementation Plan
 
+> **Source-document note (2026-09-08).** This document set was built from
+> `preview_content-only.pdf` ("Recognise, Then Range" — model-based monocular ranging with
+> gyroscope-aided tracking), which is no longer in the working tree. A different source has since
+> been supplied: Tan & Karaköse, *"A new drone chasing drone approach based on deep reinforcement
+> learning with accelerated rewards"*, SoftwareX 31 (2025) — a **DDPG** visual-servoing method with
+> no ranging, no dimension database, and no inertial aiding. Its architecture and plan live in
+> [`../drone_chasing_rl/`](../drone_chasing_rl/). The two are different methods, so they are kept
+> as separate document sets; what they share is the verified platform baseline below.
+> The finding recorded here — that *this* source contains no reinforcement learning — remains
+> correct for this source, and the new paper is where the RL work is specified.
+
 **Branch purpose.** This branch (`feat/research-proposal`) plans the ROS 2 implementation of the
 research proposal *"Recognise, Then Range: Model-Based Monocular Distance Estimation and
 Gyroscope-Aided Tracking of Small Drones from a Moving Drone"*
