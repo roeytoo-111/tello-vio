@@ -182,10 +182,18 @@ Recomputed for a 960 × 720 frame:
 | Area ratio (box area ÷ frame area) | equivalent square side ≈ 372 px | ≈ 617 px |
 | Linear ratio (box width ÷ frame width) | 192 px wide | 528 px wide |
 
-Under either reading the standoff band is **close** — of the order of one to two metres for a
-typical small quadrotor at this focal length. That is consistent with an indoor sports hall, but
-it is worth being deliberate about, because it also means the "25 m" starting distance of
-Scenario 1 [P Appendix A] is an *approach* phase, not a following distance.
+> **SUPERSEDED — this estimate was recomputed and is wrong for our target.** The "one to two
+> metres" figure below assumed a generic small quadrotor. Re-derived for a **Tello** target with
+> this repository's own calibration (fx = 919.42 px, `ost.txt`) and the Tello's 98 mm body width,
+> the 20 % threshold is reached only at **0.47 m** (0.86 m even if the box spans the propellers)
+> and the 55 % threshold at **0.17–0.31 m**. A faithful port of 20 % / 55 % would therefore
+> command *forward* continuously at every safe separation. **Do not implement these thresholds.**
+> Use the metric standoff rule instead — full derivation and replacement in
+> [drl_ros2_reference_analysis.md §6.3–6.4](drl_ros2_reference_analysis.md#63-the-papers-box-ratio-thresholds-are-unsafe-for-a-tello-target--verified-numerically).
+
+~~Under either reading the standoff band is **close** — of the order of one to two metres for a
+typical small quadrotor at this focal length.~~ The observation that still holds: the "25 m"
+starting distance of Scenario 1 [P Appendix A] is an *approach* phase, not a following distance.
 
 **[D] Recommendation**: implement the linear ratio (box width ÷ frame width), because it is
 linear in 1/distance and therefore gives a well-behaved control signal, and **calibrate the two

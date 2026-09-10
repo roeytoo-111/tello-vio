@@ -78,6 +78,13 @@ control problem is driving that pixel error to zero while holding the box size i
 
 ---
 
+> **Our setup differs from the paper's here.** The diagram above describes the *published*
+> system, whose target was a 147 g quadcopter flown by hand. In our project **both aircraft are
+> DJI Tellos**, which (a) removes the paper's follower-slower-than-target handicap, (b) requires
+> the target to be commanded rather than hand-flown, and (c) invalidates the 20 % / 55 % box-ratio
+> thresholds at Tello scale. See
+> [drl_ros2_reference_analysis.md §6](drl_ros2_reference_analysis.md#6-your-clarification-the-followed-drone-is-also-a-dji-tello).
+
 ## 2. The hybrid control decomposition — the paper's key structural choice
 
 This is the single most important thing to understand before implementing, and the paper states
@@ -216,7 +223,7 @@ VIO/SLAM stack on this repository plays no part.
 flowchart TB
     subgraph AIR["Aircraft"]
         TELLO["<b>Follower — DJI Tello</b>"]:::phys
-        TARGET["<b>Target drone</b><br/>manually flown<br/>no ROS interface needed"]:::phys
+        TARGET["<b>Target — also a DJI Tello</b><br/>commanded for repeatable scenarios<br/>needs its own driver on a SECOND HOST<br/>(UDP :8889 bind + shared 192.168.10.1)"]:::phys
     end
 
     DRV["<b>tello driver — EXISTS</b><br/>workspace/src/tello<br/>RC resent at 20 Hz · dead-man 0.35 s<br/>emergency bypass path"]:::exist
