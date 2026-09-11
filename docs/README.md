@@ -50,6 +50,10 @@ Stop there. You now know what is being built and why.
 
 Read in this order, and treat the last one as authoritative where they disagree:
 
+0. **[rl_foundations.md](drone_chasing_rl/rl_foundations.md)** — if RL is not already second
+   nature, start here: the basics (MDP, Bellman, actor-critic, DDPG's machinery) explained
+   deeply and entirely in this project's terms. The spec then reads as conclusions instead of
+   assertions.
 1. **rl_specification.md** — the whole file. It is the reference: state, action, reward, algorithm,
    hyperparameters, episode structure. Every section separates *what the paper says* from *what is
    recommended*, so you can always see which is which.
