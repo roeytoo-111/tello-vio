@@ -125,6 +125,12 @@ Build `chase_gym` per [rl_specification.md](rl_specification.md) §9, with the P
 measurements baked in: real latency distribution, real lag constant, detection dropout matched to
 the Phase 0 curve. **Validate it** by replaying a recorded flight's box trajectory and comparing.
 
+> **UPDATE (2026-09-15).** Phase 2 is now the first tier of a three-tier architecture — Gazebo
+> (lockstep physics tier) and Unreal/Colosseum (perception tier: YOLO dataset factory +
+> vision-in-the-loop evaluation) are fully specified in
+> [sim_training_architecture.md](sim_training_architecture.md), together with the
+> FOLLOW→INTERCEPT task extension and its PN baseline.
+
 Deliverable: a validated environment, with the validation plot.
 
 ### Phase 3 — Training

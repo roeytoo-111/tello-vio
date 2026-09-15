@@ -87,6 +87,13 @@ s = [ ex_n , ey_n ]
   ey_n = (yc - 360) / 360      in [-1, 1]
 ```
 
+> **UPDATE — verified against the published code (2026-09-11).** The original implementation's
+> observation is the **raw, unnormalised box-centre position** `[box_x, box_y]` in pixels
+> ([0,960] × [0,720]) — absolute position, not an error vector
+> ([rl_block_diagram.md §3](rl_block_diagram.md#3-block-diagram--training),
+> `drone_sim_env.py:24-33`, `main.py:97`). For *strict* fidelity use that; the normalised error
+> above remains the recommended form, now as a documented deviation rather than a guess.
+
 **Recommended (latency-aware), 8 dimensions:**
 
 ```
@@ -173,6 +180,13 @@ ratio of the detected bounding box to the primary screen size. If this ratio is 
 aimed to move forward; if it is above 55 %, it is aimed to move backward. If this ratio is between
 20 % and 55 %, it will not move."*
 
+> **UPDATE — resolved by the published code (2026-09-11).** The ratio is **area**:
+> `area_p = box area / 691 200 × 100` (`main.py:89-90`), with thresholds **25 % / 50 %** — not
+> the paper's 20 %/55 % — and a saturated ±200 forward/back command. At Tello scale the 25 %
+> area threshold is reached only at ≈ 0.14 m, so the unsafe-at-every-separation conclusion below
+> **worsens** under the real implementation. See
+> [rl_block_diagram.md §6–§7](rl_block_diagram.md#6-block-diagram--deployment-inference-only).
+
 **Ambiguity #10 — "ratio" is not defined** [P + V]. The paper does not say whether this is an
 **area** ratio or a **linear** ratio, and the two imply very different standoff distances.
 Recomputed for a 960 × 720 frame:
@@ -214,6 +228,13 @@ reward = -0.25 * dist        if dist > 110
 ```
 
 The 110-unit threshold *"was determined as 110 units due to the experiments"*.
+
+> **UPDATE — the published code uses threshold 100, not 110** (2026-09-11):
+> `reward -= dist*0.25 if dist > 100 else -(100 - dist)` (`drone_sim_env.py:70`) — defined
+> everywhere (the `else` catches equality) but with a **larger** cliff: 0 just inside vs −25
+> just outside. The paper's 110 exists only in the text. For reproduction use 100; a continuous
+> repair of the code variant is `r = -0.25*(dist-100)` outside. Full comparison:
+> [rl_block_diagram.md §5](rl_block_diagram.md#5-the-reward-function-exactly).
 
 ### Verified problems
 
@@ -333,6 +354,15 @@ your own convergence curve rather than inheriting any of the three.
 
 ### [D] The parameters the paper does not give — and recommended values
 
+> **UPDATE — every one of these is now known from the published code (2026-09-11)**
+> ([rl_block_diagram.md §3](rl_block_diagram.md#3-block-diagram--training)): actor
+> Flatten → Dense 16·16·16 ReLU → Dense 2 tanh → ×60; critic concat(action, obs) →
+> Dense 32·32·32 ReLU → 1 linear; buffer 100 000 (window 1); batch **32** (keras-rl default);
+> **τ = 1e-3**; optimiser **Adam lr = 1e-3, clipnorm 1** (⚠ Table 2 says 1e-4); noise
+> **Ornstein-Uhlenbeck θ=0.15, μ=0, σ=0.3**; warm-up **100** steps; updates every step;
+> `fit(nb_steps=100000)` — steps, not episodes; seed 123. The table below stays as the
+> **improved arm**; the faithful arm now uses the code's values, not these.
+
 None of the following appear anywhere in the paper, and DDPG cannot be run without them. These are
 starting points, to be recorded with the results:
 
@@ -362,6 +392,14 @@ is scaled wrongly on the aircraft. Fix it at one value, use it in both places, a
 problem"* and that training took about four hours on a CPU. **The environment's dynamics model is
 never described** — there is no statement of how target motion, follower response, or the camera
 projection are simulated. This is the largest single gap for reproduction.
+
+> **UPDATE — the actual environment is now known (2026-09-11)**, and it is *simpler than any
+> reading of the paper suggests*: a point-mass adapted from Gym's MountainCarContinuous. State =
+> box centre (px); action translates it directly (`p += 2·a`, ±120 px/step max); **no target
+> motion, no latency, no noise, no depth axis**; done on frame-edge contact; reset uniform over
+> the frame (`drone_sim_env.py`). The recommendations below are therefore not refinements of the
+> paper's simulator — they are the first simulation of the chase itself. See
+> [rl_block_diagram.md §3](rl_block_diagram.md#3-block-diagram--training).
 
 **[D] Recommended environment specification** — deliberately minimal, because the observation is
 only image-plane geometry:

@@ -30,8 +30,11 @@ reinforcement learning at all. This paper is the RL source, and it resolves that
 | File | Contents |
 |---|---|
 | [block_diagram.md](block_diagram.md) | Six block diagrams: the published approach, the hybrid control decomposition, DDPG internals, the ROS 2 node graph, the behaviour state machine, and the training→deployment path |
+| [rl_block_diagram.md](rl_block_diagram.md) | **The verified RL block diagrams** — the training and deployment pipelines reconstructed from the paper *and its published code* (`ziya44/Drone_tracking_with_drone`, commit `840487e`, cloned and read 2026-09-11; cited as **[C]** `file:line`). Resolves every DDPG detail the paper leaves unspecified, and catalogues the places where the code contradicts the paper's own text |
 | [rl_foundations.md](rl_foundations.md) | **The deep explanation, from the basics**: MDP/POMDP, Bellman and TD learning, the actor-critic mechanism, why DDPG needs its replay buffer / target networks / noise / twin-critic machinery — every concept cashed out against this project's verified numbers, with a worked update, the assembled annotated algorithm, and a diagnostics table |
+| [rl_training_guide.md](rl_training_guide.md) | **The beginner-to-expert training manual**, in four parts: I — RL from zero with derivations (bandit warm-up, Bellman derived, the contraction, MC-vs-TD, the deadly triad); II — DDPG and TD3 equation by equation, every symbol defined, four-way verified hyperparameter tables (DDPG paper · chase code · TD3 author · ours); III — the training system to build (environment, buffer, networks, trainer, checkpoint contract, deployment); IV — mastery: reward-invariance theory (Ng et al. 1999), the statistics of RL claims (Henderson et al.), sim-to-real, a 20-question oral exam with expert answers, the staged learning path, and a glossary. Sources [L1]–[L9] fetched and cited, 2026-09-13 |
 | [rl_specification.md](rl_specification.md) | **The main reference for the RL work**: state, action, reward, algorithm, hyperparameters, episode structure — what the paper specifies, what it leaves undefined, and a concrete recommended specification for each gap |
+| [sim_training_architecture.md](sim_training_architecture.md) | **The three-tier simulator architecture** for training and the intercept task: Tier A `chase_gym` (all gradients), Tier B **Gazebo** (gz-sim Harmonic/Jetty, lockstep RL, Tello stick emulation via the MulticopterVelocityControl plugin, ground-truth oracle detector), Tier C **Unreal/Colosseum** (YOLO dataset factory with auto-labels, vision-in-the-loop evaluation) — component-by-component, with the cross-tier calibration loop, FOLLOW→INTERCEPT task spec (PN baseline, potential-based range shaping), and tool facts web-verified 2026-09-15 |
 | [implementation_plan.md](implementation_plan.md) | ROS 2 packages and interfaces, mapping onto the existing `workspace/src` baseline, training and deployment phases, evaluation protocol, risks |
 | [drl_ros2_reference_analysis.md](drl_ros2_reference_analysis.md) | Verified read of the `reiniscimurs/DRL-Robot-Navigation-ROS2` reference codebase: which methods transfer to the Tello and which cannot, two empirically-confirmed defects not to copy, and the consequences of **both drones being Tellos** — including the verified finding that the paper's box-ratio thresholds are unsafe at Tello scale |
 
@@ -94,3 +97,16 @@ are in [rl_specification.md](rl_specification.md).
 
 None of these invalidate the approach. They are the decisions a faithful reimplementation has to
 make explicitly, and each is given a recommended resolution in the RL specification.
+
+### Verification round 2 — the paper's own published code (2026-09-11)
+
+The reference implementation named in the paper's metadata (`ziya44/Drone_tracking_with_drone`,
+commit `840487e`) was cloned and read line-by-line. It **resolves ambiguities #1 (yaw), #2 (raw
+box-centre pixels), #5 (the 100 000 are *steps*, not episodes) and #10 (area ratio)**, pins down
+every DDPG hyperparameter the paper omits (networks 16³/32³, OU noise θ=0.15 σ=0.3, buffer 10⁵,
+batch 32, τ=1e-3, warm-up 100, Adam 1e-3 clipnorm 1, seed 123) — and **contradicts the paper's
+text in five places**, including the reward threshold (code: 100, paper: 110) and the
+depth-rule thresholds (code: 25 %/50 % of frame *area*, saturated ±200; paper: 20 %/55 %). The
+training environment turns out to be a static point-mass world with no target motion at all.
+Full diagrams, `file:line` citations, and the discrepancy table:
+**[rl_block_diagram.md](rl_block_diagram.md)**.

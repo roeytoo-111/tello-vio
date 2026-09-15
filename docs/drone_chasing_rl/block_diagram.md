@@ -147,6 +147,13 @@ Keep lateral translation as a documented ablation.
 
 ## 3. DDPG internals and the training loop [P §2.2.2]
 
+> **UPDATE (2026-09-11).** Every dashed "not specified" box below has since been **resolved from
+> the paper's published code**, which also contradicts the paper's text in five places (reward
+> threshold, learning rate, steps-vs-episodes, depth-rule thresholds, plus an undocumented hover
+> deadband). The fully verified, step-numbered version of this diagram is
+> **[rl_block_diagram.md](rl_block_diagram.md)** — read that one for implementation. This
+> section stays as the picture of what the *paper text alone* specifies.
+
 DDPG is *"an actor-critic method … which uses two separate neural networks, one for the 'actor'
 (policy) and one for the 'critic' (value function)"* and *"uses a form of off-policy learning …
 learn from a replay buffer that stores many past experiences"* [P §2.2.2]. The diagram shows the

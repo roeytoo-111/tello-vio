@@ -276,6 +276,12 @@ same value (`r = −10 − 0.25·(dist−110)`) — and the spec keeps both vers
 because "what did the discontinuity cost" is itself a publishable measurement
 ([rl_specification.md §6](rl_specification.md)).
 
+> **UPDATE (2026-09-11).** The paper's *published code* uses threshold **100, not 110**
+> (`reward -= dist*0.25 if dist > 100 else -(100 - dist)`): defined everywhere, cliff **25**
+> points (0 inside vs −25 outside). Everything said above about the cliff's effect on the critic
+> holds — slightly amplified. Both variants and the code-anchored repair:
+> [rl_block_diagram.md §5](rl_block_diagram.md#5-the-reward-function-exactly).
+
 Two added terms, and the failure each one buys off **[D]**:
 
 - **Loss penalty** (terminal, on the box leaving the frame): the evaluation metric *is* time in
@@ -401,6 +407,13 @@ training it is why evaluation must run with **noise off** — the reference code
 Ornstein–Uhlenbeck (temporally correlated) noise; later practice found plain Gaussian equivalent
 — the paper gives σ but not the process, and the spec chooses Gaussian
 ([rl_specification.md §8](rl_specification.md)).
+
+> **UPDATE (2026-09-11).** The process is no longer unknown: the paper's published code uses
+> **Ornstein–Uhlenbeck(θ=0.15, μ=0, σ=0.3)** via keras-rl, applied only while `training=True` —
+> so deployment is provably noise-free (`rl_drone.py:55`;
+> [rl_block_diagram.md §3](rl_block_diagram.md#3-block-diagram--training)). The faithful arm
+> reproduces OU; Gaussian stays the improved-arm choice. Note also the code's action range is
+> ±60 (tanh × 60), not [−1, 1] — the clip shown above describes our normalised convention.
 
 On hardware, exploration noise passes through the safety supervisor like every other command
 **[D]** — geofence, speed cap, dead-man are outside the agent boundary (§2) and clamp noisy
