@@ -240,6 +240,15 @@ class GzChaseEnv(gym.Env):
 
 ## 4. Tier C — Unreal via Colosseum, component by component
 
+> **UPDATE (2026-09-16) — the default Tier-C engine changes to Project AirSim.** Colosseum was
+> **archived on 2026-07-11** (repository banner, verified; its main branch targets UE 5.6).
+> Project AirSim was **open-sourced 2025-05-15** (MIT; Microsoft + IAMAI announcement in
+> microsoft/AirSim discussion #5024) and is actively pushed (last push read 2026-09-16). New
+> default: **Project AirSim**; fallback: Colosseum pinned to a commit — tolerable only because
+> Tier C's jobs are batch and replaceable (§6). The §4.x component descriptions below carry the
+> AirSim-lineage API either engine exposes. Evidence and the full 2026 simulator survey:
+> [offline_training_recipe.md §6.3](offline_training_recipe.md).
+
 **Tool choice, verified** [S4]: original AirSim is archived; **Colosseum** is the maintained
 open-source fork on UE5 and keeps the AirSim API surface (settings.json, Python client, image
 APIs); **Project AirSim** (IAMAI) is the commercial-track alternative. Default: Colosseum [D];

@@ -44,3 +44,11 @@ libs/g2o/
 # Recorded bags
 *.db3
 rosbag2_*/
+
+# chase_detector runtime output (per-frame CSVs, captured training frames)
+chase_logs/
+chase_dataset/
+
+# Detector weights and training-run outputs (checkpoints, metrics, ONNX)
+yolov8n.pt
+runs/
