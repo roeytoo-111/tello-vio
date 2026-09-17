@@ -47,6 +47,10 @@ class GaussianNoise:
                 'decay_steps': self.decay_steps}
 
     def load_state_dict(self, d: dict) -> None:
+        if d.get('type', 'gaussian') != 'gaussian':
+            raise ValueError(
+                f"noise state is {d.get('type')!r}, this run builds "
+                f"gaussian -- arm/config mismatch on resume")
         self._step = int(d['step'])
         self.sigma0 = float(d.get('sigma0', self.sigma0))
         self.sigma_min = float(d.get('sigma_min', self.sigma_min))
@@ -79,4 +83,8 @@ class OUNoise:
         return {'type': 'ou', 'x': self.x.tolist()}
 
     def load_state_dict(self, d: dict) -> None:
+        if d.get('type', 'ou') != 'ou':
+            raise ValueError(
+                f"noise state is {d.get('type')!r}, this run builds ou -- "
+                f"arm/config mismatch on resume")
         self.x = np.asarray(d['x'], dtype=np.float64)

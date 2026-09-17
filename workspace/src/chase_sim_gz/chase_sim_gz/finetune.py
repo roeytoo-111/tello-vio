@@ -22,7 +22,8 @@ import torch
 from chase_gym.env import EnvConfig
 
 from chase_train.buffer import ReplayBuffer
-from chase_train.checkpoint import load_bundle, save_bundle, versioned_name
+from chase_train.checkpoint import (load_bundle, require_format,
+                                    save_bundle, versioned_name)
 from chase_train.config import RunConfig, _build
 from chase_train.noise import GaussianNoise
 from chase_train.train import build_trainer, seed_everything
@@ -47,6 +48,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     bundle = load_bundle(args.checkpoint)
+    require_format(bundle)          # full-state restore: v1 refusal
     cfg = _build(dict(bundle['config']))
     if bundle['obs_spec']['mode'] != 'latency_aware':
         raise SystemExit('fine-tune needs a latency-aware Tier-A bundle')
@@ -115,8 +117,7 @@ def main(argv=None):
                 env_config=dict(bundle['env_config'], tier='B'),
                 env_step=bundle['env_step'] + args.steps,
                 eval_snapshot={'time_in_view': tv_steps / max(steps_total, 1)},
-                run_rng=rng,
-                env_rng_state=env.unwrapped.np_random.bit_generator.state)
+                run_rng=rng, env=env)
     print(f'[done] fine-tuned bundle: {out}')
     return 0
 

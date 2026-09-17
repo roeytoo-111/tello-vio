@@ -21,6 +21,21 @@ import numpy as np
 from chase_gym import ChaseEnv, EnvConfig
 from chase_gym.target_motion import FAMILIES
 
+# Derived, never restated: the acceptance population of guide 28.4 (beat
+# the P-controller on the MOVING families; match it on static).
+MOVING_FAMILIES = tuple(f for f in FAMILIES if f != 'static')
+
+
+def selection_tv(suite: dict) -> float:
+    """The one selection metric train.py and report_matrix share: mean
+    time-in-view over the moving families (what 28.4 acceptance judges),
+    falling back to the aggregate when the suite has no families (the
+    faithful arm's point-mass world)."""
+    fams = suite.get('families') or {}
+    vals = [fams[f]['time_in_view'] for f in MOVING_FAMILIES if f in fams]
+    return float(np.mean(vals)) if vals else \
+        float(suite['aggregate']['time_in_view'])
+
 
 class ActorPolicy:
     """The one adapter that makes a trained actor look like a controller:
@@ -58,6 +73,10 @@ class FamilyResult:
         n = max(len(self.returns), 1)
         return {
             'family': self.family,
+            # Per-episode scores travel with the summary: bootstrap CIs
+            # need episode replication, not just family means.
+            'tv_episodes': [float(x) for x in self.time_in_view],
+            'return_episodes': [float(x) for x in self.returns],
             'episodes': len(self.returns),
             'return_mean': float(np.mean(self.returns)) if self.returns else float('nan'),
             'return_std': float(np.std(self.returns)) if self.returns else float('nan'),

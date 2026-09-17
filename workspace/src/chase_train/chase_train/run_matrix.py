@@ -73,8 +73,10 @@ def main(argv=None):
     ap.add_argument('--with-sb3', action='store_true',
                     help='add the SB3 TD3 cross-check per seed '
                          '(recipe stage 3: the 4th arm)')
-    ap.add_argument('--report', action='store_true', default=True,
-                    help='aggregate IQM/CI + 28.4 acceptance at the end')
+    ap.add_argument('--report', action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help='aggregate IQM/CI + 28.4 acceptance at the end '
+                         '(--no-report to skip)')
     args = ap.parse_args(argv)
 
     cells = [(arm, seed) for arm in args.arms for seed in args.seeds]
@@ -100,8 +102,12 @@ def main(argv=None):
     print(f'matrix complete: {len(results) - len(failed)}/{len(results)} ok; '
           f'index: {index_path}')
     if args.report and len(results) > len(failed):
-        from .report_matrix import main as report_main
-        report_main(['--runs', args.out_root])
+        # A report failure must never mask the matrix's own status.
+        try:
+            from .report_matrix import main as report_main
+            report_main(['--runs', args.out_root])
+        except Exception as e:
+            print(f'[matrix] report step failed: {e}', file=sys.stderr)
     return 1 if failed else 0
 
 

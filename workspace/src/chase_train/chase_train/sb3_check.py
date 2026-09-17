@@ -60,14 +60,28 @@ def main(argv=None):
     model.learn(total_timesteps=cfg.train.total_steps, progress_bar=False)
     wall = time.time() - t0
 
+    # Score on the HELD-OUT block, like every arm's reported numbers --
+    # the cross-check must be comparable to the matrix report.
+    heldout_seed0 = cfg.eval.eval_seed0 + 500_000
     suite = run_suite(
         lambda o: model.predict(o, deterministic=True)[0],
         default_env_factory(cfg.env),
         episodes_per_family=cfg.eval.episodes_per_scenario,
-        eval_seed0=cfg.eval.eval_seed0)
+        eval_seed0=heldout_seed0)
     out_dir = os.path.join(cfg.out_root,
                            f'sb3_td3_s{cfg.seed}_{time.strftime("%Y%m%d_%H%M%S")}')
     os.makedirs(out_dir, exist_ok=True)
+    # Matrix-report compatibility: the same config.json/metrics.jsonl
+    # surface train.py writes, under its own arm name so it can never
+    # merge with the hand-rolled td3 rows.
+    with open(os.path.join(out_dir, 'config.json'), 'w') as f:
+        json.dump({'config': {**cfg.to_dict(), 'arm': 'sb3_td3'},
+                   'hash': cfg.config_hash()}, f, indent=2)
+    with open(os.path.join(out_dir, 'metrics.jsonl'), 'w') as f:
+        f.write(json.dumps({'env_step': cfg.train.total_steps,
+                            'final_heldout': suite,
+                            'heldout_seed0': heldout_seed0,
+                            'heldout_subject': 'sb3 final weights'}) + '\n')
     with open(os.path.join(out_dir, 'sb3_result.json'), 'w') as f:
         json.dump({'suite': suite, 'wall_s': wall,
                    'config': cfg.to_dict(), 'sb3_sigma': sigma_mid,
@@ -77,12 +91,14 @@ def main(argv=None):
                        f'{n.sigma0}->{n.sigma_min})',
                        'single learning_rate for actor+critic (SB3 API)',
                        'no demonstration prefill', 'no curriculum',
-                       'SB3 default final-layer init (not +/-3e-3)',
+                       f'SB3 default final-layer init '
+                       f'(not +/-{cfg.nets.final_init})',
                    ]}, f, indent=2)
     agg = suite['aggregate']
     print(f"[sb3-check] steps {cfg.train.total_steps}  "
           f"ret {agg['return_mean']:.2f}  tv {agg['time_in_view']:.2%}  "
-          f"({wall:.0f}s)  -> {out_dir}")
+          f"({wall:.0f}s)")
+    print(f'[done] run dir: {out_dir}')   # run_matrix parses this line
 
 
 if __name__ == '__main__':

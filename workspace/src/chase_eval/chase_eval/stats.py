@@ -23,6 +23,23 @@ def iqm(values: Sequence[float]) -> float:
     return float(mid.mean()) if len(mid) else float(v.mean())
 
 
+def bootstrap_ci(values: Sequence[float], n_boot: int = 2000,
+                 alpha: float = 0.05, seed: int = 0
+                 ) -> Tuple[float, float, float]:
+    """(IQM, ci_lo, ci_hi) for one sample with no seed axis (e.g. the
+    P-controller baseline): plain percentile bootstrap over episodes."""
+    rng = np.random.default_rng(seed)
+    v = np.asarray(values, dtype=float)
+    point = iqm(v)
+    if len(v) < 2:
+        return point, float('nan'), float('nan')
+    stats = np.empty(n_boot)
+    for b in range(n_boot):
+        stats[b] = iqm(rng.choice(v, size=len(v), replace=True))
+    lo, hi = np.percentile(stats, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return point, float(lo), float(hi)
+
+
 def stratified_bootstrap_ci(per_seed_scores: Dict[int, Sequence[float]],
                             n_boot: int = 2000, alpha: float = 0.05,
                             seed: int = 0) -> Tuple[float, float, float]:

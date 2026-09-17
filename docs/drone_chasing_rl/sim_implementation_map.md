@@ -26,6 +26,7 @@ workspace/src/
     chase_gym/target_motion.py   the five generator families + curriculum speed caps
     chase_gym/kinematics.py      follower first-order lag + world→camera pinhole projection
     chase_gym/env.py             ChaseEnv (gymnasium.Env): FOLLOW and INTERCEPT, §16.1 step
+    chase_gym/pipeline.py        MeasurementPipe + the cross-tier reset DRAW ORDER CONTRACT
     chase_gym/faithful_env.py    exact port of the original drone_sim_env.py [C]
     chase_gym/baselines.py       P-controller + PN — get_action(obs) interface (demo source)
   chase_train/      the one trainer (ament_python, imports NO ROS)
@@ -37,13 +38,17 @@ workspace/src/
     chase_train/config.py        the §15 config block; YAML presets per arm
     chase_train/checkpoint.py    §19 bundle + versioned names + best.json + ONNX (opset 17)
     chase_train/train.py         §11.7 loop, curriculum, eval hook, stopping rule; CLI
-    chase_train/run_matrix.py    arms × seeds matrix, scripted
+    chase_train/run_matrix.py    arms × seeds matrix, scripted (--with-sb3, auto-report)
+    chase_train/report_matrix.py IQM + bootstrap CIs on held-out episodes, P-controller
+                                 baseline CI, the guide-28.4 acceptance verdict
     chase_train/sb3_check.py     SB3 2.9 TD3 on the identical env (external cross-check)
     config/{td3,ddpg_repaired,ddpg_faithful,td3_intercept}.yaml
   chase_eval/       evaluation + gates (ament_python, imports NO ROS)
-    chase_eval/evaluate.py       frozen-scenario suite, noise off: return / time-in-view / loss
-    chase_eval/stats.py          IQM + stratified bootstrap CIs (rliable protocol, native impl)
-    chase_eval/replay_validation.py  the §16.3 gate: command log → sim track vs YOLO CSV track
+    chase_eval/evaluate.py       frozen-scenario suite (per-episode scores), ActorPolicy,
+                                 MOVING_FAMILIES + the shared selection metric
+    chase_eval/cli.py            evaluate a bundle or the P/PN baselines on the suite
+    chase_eval/stats.py          IQM + episode/stratified bootstrap CIs (rliable protocol)
+    chase_eval/replay_validation.py  the §16.3 gate: static-target protocol, centre+width
   chase_sim_gz/     Tier B (ament_python, ROS 2 Humble + gz-sim Harmonic)
     chase_sim_gz/gz_iface.py     the only file that talks gz-transport; mockable interface
     chase_sim_gz/gz_chase_env.py GzChaseEnv: lockstep WorldControl multi-step (100 × 1 ms)
@@ -51,11 +56,18 @@ workspace/src/
     chase_sim_gz/sim_oracle_detector.py  truth→DroneDetection with OUR calibration + corruption
     chase_sim_gz/latency_shim.py     sim-time delay of DroneDetection messages
     chase_sim_gz/sign_test.py    §3.2-item-4 protocol, automated (run after install)
+    chase_sim_gz/calibrate_lag.py    step-response fit vs the measured T_lag (§3.2)
+    chase_sim_gz/ab_replay_gate.py   identical action log through Tier A and Tier B
+    chase_sim_gz/finetune.py     continue a Tier-A bundle ~1e4 lockstep steps (§3.5)
+    chase_sim_gz/gen_world.py    emits worlds/chase.sdf from one parameterisation
     worlds/chase.sdf             two multicopters, MulticopterVelocityControl + motor models
     launch/tier_b.launch.py · config/bridge_*.yaml
 sim/tier_c_airsim/  Tier C (engine-hosted machine; not a ROS package)
-    dataset_factory.py           YOLO dataset with segmentation-derived auto-labels
+    engine.py                    ONE adapter over Project AirSim / classic (units, yaw
+                                 handedness, image-type traps contained here)
+    dataset_factory.py           YOLO dataset with exact auto-labels, operator-attested lighting
     vision_in_loop_eval.py       real YOLO + trained actor closed loop, flight metrics
+    tier_c_sign_test.py          the §4.4 sign protocol against a live engine
     settings/ · README.md        camera 960×720 FOV 55.1°; Project AirSim default,
                                  Colosseum-pinned fallback
 scripts/install_gz_harmonic.sh   apt steps for gz-sim Harmonic + ros_gz on 22.04 (needs sudo)

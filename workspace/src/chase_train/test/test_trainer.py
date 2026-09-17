@@ -222,3 +222,27 @@ def test_ou_stationary_std():
     samples = [ou.sample(rng)[0] for _ in range(120_000)]
     tail = np.asarray(samples[80_000:])
     assert np.std(tail) == pytest.approx(0.3 / np.sqrt(2 * 0.15), abs=0.06)
+
+
+def test_metrics_merge_keeps_actor_loss_across_parities():
+    """train.py merges update dicts; with policy_delay=2 the actor_loss
+    from one parity must survive the actor-less dict from the other
+    (review: assignment made actor_loss unobservable for TD3 arms)."""
+    tr = make_trainer(policy_delay=2)
+    rng = np.random.default_rng(0)
+    merged = {}
+    for _ in range(4):
+        m = tr.update(rand_batch(rng), compute_metrics=True)
+        if m:
+            merged.update(m)
+    assert 'actor_loss' in merged
+    assert 'critic_loss' in merged
+
+
+def test_noise_state_type_guard():
+    from chase_train.noise import GaussianNoise, OUNoise
+    g, o = GaussianNoise(), OUNoise()
+    with pytest.raises(ValueError, match='mismatch'):
+        g.load_state_dict(o.state_dict())
+    with pytest.raises(ValueError, match='mismatch'):
+        o.load_state_dict(g.state_dict())

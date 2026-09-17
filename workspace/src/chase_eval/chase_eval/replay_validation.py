@@ -27,29 +27,17 @@ flight and asserts both directions: correct T_lag passes, a grossly wrong
 T_lag scores worse.
 """
 import argparse
-import bisect
 import csv
 import json
 import math
 import sys
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 
 from chase_gym import constants as C
 from chase_gym.kinematics import (FollowerKinematics, FollowerState, project,
                                   world_to_camera)
-
-
-@dataclass
-class Snapshot:
-    t: float
-    pos: np.ndarray
-    yaw: float
-
-    def state(self) -> FollowerState:
-        return FollowerState(pos=self.pos.copy(), yaw=self.yaw)
 
 
 def load_detections(path: str) -> List[dict]:
@@ -77,19 +65,43 @@ def load_commands(path: str) -> List[dict]:
     return rows
 
 
+class StateTrack:
+    """Replayed follower states as flat numpy arrays (an hour-long log at
+    n_sub=10 would be ~720k per-substep dataclass objects otherwise) with
+    searchsorted lookup. Values are COPIED out of the mutating kinematics
+    state -- aliasing it was the original sin this gate shipped with."""
+
+    def __init__(self, n: int):
+        self.t = np.empty(n)
+        self.pos = np.empty((n, 3))
+        self.yaw = np.empty(n)
+        self.n = 0
+
+    def push(self, t: float, pos: np.ndarray, yaw: float) -> None:
+        self.t[self.n] = t
+        self.pos[self.n] = pos
+        self.yaw[self.n] = yaw
+        self.n += 1
+
+    def state_at(self, t: float) -> FollowerState:
+        """Newest stored state with timestamp <= t."""
+        i = max(int(np.searchsorted(self.t[:self.n], t, side='right')) - 1,
+                0)
+        return FollowerState(pos=self.pos[i].copy(), yaw=float(self.yaw[i]))
+
+
 def integrate_states(commands: List[dict], t_lag: float, v_max: float,
-                     omega_max: float, n_sub: int = 10) -> List[Snapshot]:
-    """Replay the command log through the Tier-A follower kinematics,
-    returning DEEP-COPIED snapshots (the kinematics object mutates one
-    state in place -- aliasing it was the original sin this gate shipped
-    with). Each command interval is integrated in n_sub substeps and a
-    snapshot stored per substep: the aircraft is continuous, and coarse
-    Euler at the command period plus zero-order-hold state lookup at the
-    30 Hz detection times costs >10 px against a 6 px tolerance."""
+                     omega_max: float, n_sub: int = 10) -> StateTrack:
+    """Replay the command log through the Tier-A follower kinematics.
+    Each command interval is integrated in n_sub substeps and a state
+    stored per substep: the aircraft is continuous, and coarse Euler at
+    the command period plus zero-order-hold lookup at the 30 Hz detection
+    times costs >10 px against a 6 px tolerance."""
     fk = FollowerKinematics(t_lag)
     fk.reset()
     t0 = commands[0]['t']
-    snaps = [Snapshot(0.0, fk.state.pos.copy(), fk.state.yaw)]
+    track = StateTrack(1 + n_sub * (len(commands) - 1))
+    track.push(0.0, fk.state.pos, fk.state.yaw)
     for i in range(1, len(commands)):
         dt = commands[i]['t'] - commands[i - 1]['t']
         if dt <= 0.0:
@@ -106,16 +118,8 @@ def integrate_states(commands: List[dict], t_lag: float, v_max: float,
         for j in range(1, n_sub + 1):
             fk.step(c['v_fwd'], c['a_v'] * v_max, c['a_h'] * omega_max,
                     dt / n_sub)
-            snaps.append(Snapshot(t_base + j * dt / n_sub,
-                                  fk.state.pos.copy(), fk.state.yaw))
-    return snaps
-
-
-def state_at(snaps: List[Snapshot], times: List[float], t: float
-             ) -> Snapshot:
-    """Newest snapshot with timestamp <= t (bisect on the shared times)."""
-    i = bisect.bisect_right(times, t) - 1
-    return snaps[max(i, 0)]
+            track.push(t_base + j * dt / n_sub, fk.state.pos, fk.state.yaw)
+    return track
 
 
 def back_project(det: dict, st: FollowerState) -> np.ndarray:
@@ -140,10 +144,11 @@ def validate(dets: List[dict], cmds: List[dict], t_lag: float,
     range errors, but the box width w = fx*W/z is not."""
     t0 = cmds[0]['t']
     dets = [dict(d, t=d['t'] - t0) for d in dets if d['t'] >= t0]
-    if len(dets) < max(n_anchor, 20):
+    if len(dets) < n_anchor + 20:
         raise ValueError(
             f'only {len(dets)} detections overlap the command log '
-            f'(>= {max(n_anchor, 20)} required for a verdict)')
+            f'(>= {n_anchor + 20} required: {n_anchor} anchors + 20 '
+            f'scored frames)')
     # The anchor estimate assumes the follower is AT REST when the log
     # starts (integrate_states starts from hover). Warn loudly if the log
     # opens with live commands -- the estimate would be biased.
@@ -154,22 +159,24 @@ def validate(dets: List[dict], cmds: List[dict], t_lag: float,
               'static-target anchor assumes an at-rest start -- trim the '
               'log to begin at hover or expect a biased estimate',
               file=sys.stderr)
-    snaps = integrate_states(cmds, t_lag, v_max, omega_max)
-    times = [s.t for s in snaps]
+    track = integrate_states(cmds, t_lag, v_max, omega_max)
 
     anchors = dets[:n_anchor]
     est = np.median(np.stack([
-        back_project(d, state_at(snaps, times, d['t']).state())
-        for d in anchors]), axis=0)
+        back_project(d, track.state_at(d['t'])) for d in anchors]), axis=0)
 
+    # Anchors are EXCLUDED from scoring: back_project -> project is a
+    # near-identity round trip for the frames that produced the estimate,
+    # so scoring them would let self-fit residuals dominate the median on
+    # short logs -- an optimistic bias on a gate whose job is refusal.
     errors, width_errors = [], []
-    for d in dets:
-        st = state_at(snaps, times, d['t']).state()
+    for d in dets[n_anchor:]:
+        st = track.state_at(d['t'])
         u, v, w_px, in_frame = project(world_to_camera(est, st))
         errors.append(math.hypot(u - d['cx'], v - d['cy']))
         width_errors.append(abs(w_px - d['w']))
     return {'target_estimate': est.tolist(), 'errors_px': errors,
-            'width_errors_px': width_errors}
+            'width_errors_px': width_errors, 'anchors_excluded': n_anchor}
 
 
 def main(argv=None):
@@ -179,7 +186,12 @@ def main(argv=None):
     ap.add_argument('--t-lag', type=float, default=0.25)
     ap.add_argument('--v-max', type=float, default=1.5)
     ap.add_argument('--omega-max', type=float, default=1.5)
-    ap.add_argument('--tolerance-px', type=float, default=6.0)
+    ap.add_argument('--tolerance-px', type=float, default=6.0,
+                    help='centre-error tolerance (detector jitter band)')
+    ap.add_argument('--width-tolerance-px', type=float, default=3.0,
+                    help='box-width tolerance: the forward-axis gate. '
+                         'Width px are worth ~10x more range than centre '
+                         'px, hence the separate, tighter knob')
     ap.add_argument('--out', default='replay_validation.json')
     ap.add_argument('--self-test', action='store_true')
     args = ap.parse_args(argv)
@@ -207,10 +219,12 @@ def main(argv=None):
     median = float(np.median(err))
     p90 = float(np.percentile(err, 90))
     w_median = float(np.median(werr))
-    ok = median <= args.tolerance_px and w_median <= args.tolerance_px
+    ok = (median <= args.tolerance_px
+          and w_median <= args.width_tolerance_px)
     result = {'frames': len(err), 'median_px': median, 'p90_px': p90,
               'width_median_px': w_median,
-              'tolerance_px': args.tolerance_px, 'pass': ok,
+              'tolerance_px': args.tolerance_px,
+              'width_tolerance_px': args.width_tolerance_px, 'pass': ok,
               't_lag': args.t_lag,
               'target_estimate_m': res['target_estimate'],
               'protocol': 'static-target [D-impl]'}
@@ -294,7 +308,7 @@ def self_test(tolerance_px: float) -> int:
     w_good = float(np.median(good['width_errors_px']))
     m_bad = float(np.median(bad['errors_px']))
     w_bad = float(np.median(bad['width_errors_px']))
-    ok = (m_good <= tolerance_px and w_good <= tolerance_px
+    ok = (m_good <= tolerance_px and w_good <= 3.0
           and (m_bad > 1.5 * m_good or w_bad > 1.5 * w_good))
     print(f'[self-test] {len(dets)} detections / {len(cmds)} commands '
           f'(via CSV loaders); @true T_lag centre {m_good:.2f} px, width '

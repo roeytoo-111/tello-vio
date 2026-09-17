@@ -116,3 +116,24 @@ def test_fake_backend_first_order_response():
         times.append(0.1 * k)
         vels.append(float(b.get_odom('follower').lin_body[0]))
     assert fit_t_lag(times, vels, 0.5) == pytest.approx(0.15, rel=0.1)
+
+
+def test_sub_period_step_refused_by_contract():
+    """Both backends refuse steps shorter than one odom publish period --
+    the caller contract that keeps stale/pre-teleport poses impossible."""
+    b = FakeGzBackend()
+    b.start()
+    with pytest.raises(ValueError, match='publish period'):
+        b.step(5)
+    b.step(12)                            # >= one period with margin: fine
+
+
+def test_selection_tv_moving_vs_aggregate():
+    from chase_eval.evaluate import MOVING_FAMILIES, selection_tv
+    fams = {f: {'time_in_view': 0.5} for f in MOVING_FAMILIES}
+    fams['static'] = {'time_in_view': 1.0}
+    suite = {'families': fams, 'aggregate': {'time_in_view': 0.9}}
+    assert selection_tv(suite) == pytest.approx(0.5)   # static excluded
+    assert selection_tv({'families': {},
+                         'aggregate': {'time_in_view': 0.7}}) == \
+        pytest.approx(0.7)                             # faithful fallback

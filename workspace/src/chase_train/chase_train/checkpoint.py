@@ -45,12 +45,85 @@ def library_versions() -> dict:
             'gymnasium': gymnasium.__version__}
 
 
+# format_version history:
+#   1 -- initial contract.
+#   2 -- faithful critic concat order fixed to (action, obs) [C]; v1
+#        faithful bundles load without shape errors but with transposed
+#        first-layer semantics, so full-state restores REFUSE v1.
+FORMAT_VERSION = 2
+
+
+def capture_rng(run_rng=None, env=None, diag_rng=None, device=None) -> dict:
+    """EVERY stream a resume must restore, captured in one place -- the
+    hand-mirrored save/restore pair is how torch_cuda got missed once.
+    restore_rng() is its inverse; extend BOTH together."""
+    cuda_states = None
+    if device is not None and getattr(device, 'type', device) == 'cuda' \
+            and torch.cuda.is_available():
+        # Only when the run actually trains on CUDA: get_rng_state_all on
+        # a CPU run would initialise a context on every visible GPU.
+        cuda_states = torch.cuda.get_rng_state_all()
+    return {
+        'python': random.getstate(),
+        'numpy_legacy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+        'torch_cuda': cuda_states,
+        'numpy_generator': (run_rng.bit_generator.state
+                            if run_rng is not None else None),
+        'env_generator': (env.unwrapped.np_random.bit_generator.state
+                          if env is not None else None),
+        'diag_generator': (diag_rng.bit_generator.state
+                           if diag_rng is not None else None),
+    }
+
+
+def restore_rng(rng_state: dict, run_rng=None, env=None, diag_rng=None) -> None:
+    """Inverse of capture_rng. Missing keys (older bundles) are skipped;
+    a CUDA-state/device-count mismatch warns and skips instead of crashing
+    an hours-long resume."""
+    if rng_state.get('python') is not None:
+        random.setstate(rng_state['python'])
+    if rng_state.get('numpy_legacy') is not None:
+        np.random.set_state(rng_state['numpy_legacy'])
+    if rng_state.get('torch') is not None:
+        torch.set_rng_state(rng_state['torch'])
+    cuda_states = rng_state.get('torch_cuda')
+    if cuda_states is not None:
+        if torch.cuda.is_available() \
+                and len(cuda_states) <= torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_states)
+        else:
+            print('[resume] WARNING: bundle carries CUDA RNG for '
+                  f'{len(cuda_states)} device(s); this host cannot restore '
+                  'it -- CUDA noise stream restarts')
+    if run_rng is not None and rng_state.get('numpy_generator') is not None:
+        run_rng.bit_generator.state = rng_state['numpy_generator']
+    if env is not None and rng_state.get('env_generator') is not None:
+        env.unwrapped.np_random.bit_generator.state = \
+            rng_state['env_generator']
+    if diag_rng is not None and rng_state.get('diag_generator') is not None:
+        diag_rng.bit_generator.state = rng_state['diag_generator']
+
+
+def require_format(bundle: dict, minimum: int = FORMAT_VERSION) -> None:
+    """Refuse full-state restores of bundles older than `minimum` -- the
+    v1->v2 change altered network semantics without changing state-dict
+    shapes, so loading would silently scramble the critic."""
+    got = int(bundle.get('format_version', 1))
+    if got < minimum:
+        raise ValueError(
+            f'bundle format_version {got} < required {minimum}: its '
+            f'network weights are not semantically compatible with this '
+            f'code (faithful critic concat order changed in v2) -- '
+            f'retrain rather than resume')
+
+
 def save_bundle(path: str, *, trainer, noise, cfg, obs_spec, action_map: dict,
                 env_config: dict, env_step: int, eval_snapshot: dict,
                 curriculum_stage: int = 0, run_rng=None,
-                env_rng_state=None) -> str:
+                env=None, diag_rng=None) -> str:
     bundle = {
-        'format_version': 1,
+        'format_version': FORMAT_VERSION,
         'arm': cfg.arm,
         'seed': cfg.seed,
         'env_step': int(env_step),
@@ -68,23 +141,8 @@ def save_bundle(path: str, *, trainer, noise, cfg, obs_spec, action_map: dict,
         'library_versions': library_versions(),
         'eval': eval_snapshot,
         'curriculum_stage': int(curriculum_stage),
-        'rng': {
-            'python': random.getstate(),
-            'numpy_legacy': np.random.get_state(),
-            'torch': torch.get_rng_state(),
-            # The run's own Generator (exploration, batch indices): the
-            # state a resume must restore to truly continue the stream.
-            'numpy_generator': (run_rng.bit_generator.state
-                                if run_rng is not None else None),
-            # The training env's own Generator (episode draws): restoring
-            # it is what makes a resume a continuation of the episode
-            # stream rather than a replay from the seed.
-            'env_generator': env_rng_state,
-            # torch.get_rng_state() is the CPU generator only; the TD3
-            # target-smoothing noise runs on the training device.
-            'torch_cuda': (torch.cuda.get_rng_state_all()
-                           if torch.cuda.is_available() else None),
-        },
+        'rng': capture_rng(run_rng=run_rng, env=env, diag_rng=diag_rng,
+                           device=getattr(trainer, 'device', None)),
         'saved_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
     }
     torch.save(bundle, path)

@@ -163,16 +163,22 @@ class ProjectAirSimEngine(EngineBase):
                             c['x'] + s['x'] / 2.0, c['y'] + s['y'] / 2.0))
         return out
 
+    @staticmethod
+    def _ned_yaw_rate(rep103_rad_s: float) -> float:
+        """REP-103 (+CCW, z-up) -> Project AirSim NED rad/s (+CW, z-down).
+        THE one conversion point: a new velocity API must call this or it
+        yaws backwards."""
+        return -float(rep103_rad_s)
+
     def move_by_velocity(self, v_north, v_east, v_down, yaw_rate_rad_s,
                          duration_s) -> None:
         import asyncio
         from projectairsim.drone import YawControlMode
-        # Project AirSim yaw is rad/s [V drone.py docstring]; NED is
-        # CW-positive, our contract is REP-103 CCW-positive -> negate.
+        # Project AirSim yaw is rad/s [V drone.py docstring].
         task = self._drone.move_by_velocity_async(
             float(v_north), float(v_east), float(v_down), float(duration_s),
             yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
-            yaw_is_rate=True, yaw=-float(yaw_rate_rad_s))
+            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s))
         asyncio.get_event_loop().run_until_complete(task)
 
     def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
@@ -182,7 +188,7 @@ class ProjectAirSimEngine(EngineBase):
         task = self._drone.move_by_velocity_body_frame_async(
             float(v_fwd), float(v_right), float(v_down), float(duration_s),
             yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
-            yaw_is_rate=True, yaw=-float(yaw_rate_rad_s))  # NED: CCW->CW
+            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s))
         asyncio.get_event_loop().run_until_complete(task)
 
     def hover(self) -> None:
@@ -260,16 +266,21 @@ class ClassicEngine(EngineBase):
         return [BBox(d.name, d.box2D.min.x_val, d.box2D.min.y_val,
                      d.box2D.max.x_val, d.box2D.max.y_val) for d in dets]
 
+    @staticmethod
+    def _ned_yaw_rate_deg(rep103_rad_s: float) -> float:
+        """REP-103 (+CCW, rad/s) -> classic AirSim NED yaw_or_rate
+        (+CW, DEGREES/s). THE one conversion point for this backend."""
+        return -math.degrees(rep103_rad_s)
+
     def move_by_velocity(self, v_north, v_east, v_down, yaw_rate_rad_s,
                          duration_s) -> None:
         a = self._airsim
-        # Classic yaw_mode is DEGREES/s [V apis.md] AND NED CW-positive:
-        # convert units and negate from our REP-103 CCW contract.
         self._client.moveByVelocityAsync(
             float(v_north), float(v_east), float(v_down), float(duration_s),
             drivetrain=a.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode=a.YawMode(is_rate=True,
-                               yaw_or_rate=-math.degrees(yaw_rate_rad_s)),
+                               yaw_or_rate=self._ned_yaw_rate_deg(
+                                   yaw_rate_rad_s)),
             vehicle_name=self.vehicle).join()
 
     def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
@@ -279,7 +290,8 @@ class ClassicEngine(EngineBase):
             float(v_fwd), float(v_right), float(v_down), float(duration_s),
             drivetrain=a.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode=a.YawMode(is_rate=True,
-                               yaw_or_rate=-math.degrees(yaw_rate_rad_s)),
+                               yaw_or_rate=self._ned_yaw_rate_deg(
+                                   yaw_rate_rad_s)),
             vehicle_name=self.vehicle).join()
 
     def hover(self) -> None:

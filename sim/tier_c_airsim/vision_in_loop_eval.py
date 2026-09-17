@@ -118,9 +118,10 @@ def main(argv=None):
     ap.add_argument('--checkpoint')
     ap.add_argument('--baseline', choices=['p_controller', 'pn'])
     ap.add_argument('--yolo', required=True, help='ultralytics weights')
-    ap.add_argument('--task', default='follow',
+    ap.add_argument('--task', default=None,
                     choices=['follow', 'intercept'],
-                    help='baselines only; a checkpoint brings its own task')
+                    help='baselines only (default follow); a checkpoint '
+                         'brings its own task')
     ap.add_argument('--episodes', type=int, default=10)
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--out', default='vision_in_loop_result.json')
@@ -139,7 +140,7 @@ def main(argv=None):
                 f'it there (got --task {args.task})')
         label = os.path.basename(args.checkpoint)
     else:
-        cfg = EnvConfig(task=args.task)
+        cfg = EnvConfig(task=args.task or 'follow')
         policy = (PController(spec) if args.baseline == 'p_controller'
                   else PNController(spec))
         label = args.baseline

@@ -114,7 +114,9 @@ class GzChaseEnv(gym.Env):
         # controllers after the world reset re-instantiated them.
         self.backend.send_twist(self.follower, (0, 0, 0), 0.0)
         self.backend.send_twist(self.target, (0, 0, 0), 0.0)
-        self.backend.step(10)
+        # >= one odom publish period WITH margin (the backend refuses
+        # sub-period steps; exactly-one-period would ride float equality).
+        self.backend.step(12)
 
         self._family = family
         od_t = self.backend.get_odom(self.target)

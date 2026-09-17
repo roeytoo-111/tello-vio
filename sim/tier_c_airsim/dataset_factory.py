@@ -78,14 +78,21 @@ def run(engine_name: str, out_dir: str, target_object: str,
     os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'labels'), exist_ok=True)
     meta_path = os.path.join(out_dir, 'metadata.csv')
+    # APPEND: the workflow is one run per lighting class into one dataset
+    # dir -- truncating here would wipe the previous class's rows while
+    # its images stay on disk.
+    write_header = not (os.path.exists(meta_path)
+                        and os.path.getsize(meta_path) > 0)
     eng = make_engine(engine_name)
     eng.connect()
     n = 0
     try:
-        with open(meta_path, 'w', newline='') as mf:
+        with open(meta_path, 'a', newline='') as mf:
             meta = csv.writer(mf)
-            meta.writerow(['stem', 'range_m', 'azimuth_deg', 'elevation_deg',
-                           'target_yaw_deg', 'lighting', 'w_px', 'h_px'])
+            if write_header:
+                meta.writerow(['stem', 'range_m', 'azimuth_deg',
+                               'elevation_deg', 'target_yaw_deg',
+                               'lighting', 'w_px', 'h_px'])
             for r, az, el, tyaw, ned in pose_grid():
                 eng.set_object_pose(target_object, ned,
                                     math.radians(tyaw))
@@ -140,10 +147,11 @@ def main(argv=None):
                     choices=['projectairsim', 'classic'])
     ap.add_argument('--out', default='chase_dataset')
     ap.add_argument('--target-object', default='TargetTello')
-    ap.add_argument('--lighting', default='medium',
+    ap.add_argument('--lighting', required=True,
                     choices=LIGHTING_CLASSES,
-                    help='label for THIS run; set the scene lighting in '
-                         'the engine first, then run once per class')
+                    help='REQUIRED attestation of the scene lighting you '
+                         'set in the engine for THIS run -- a default '
+                         'would turn forgetfulness into wrong labels')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
     if args.dry_run:

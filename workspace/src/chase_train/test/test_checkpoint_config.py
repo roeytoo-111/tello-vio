@@ -124,3 +124,41 @@ def test_override_parsing():
     assert cfg.env['latency'] is False
     assert cfg.train.total_steps == 1234
     assert cfg.seed == 7
+
+
+def test_format_version_refusal():
+    from chase_train.checkpoint import FORMAT_VERSION, require_format
+    require_format({'format_version': FORMAT_VERSION})
+    with pytest.raises(ValueError, match='format_version 1'):
+        require_format({'format_version': 1})
+    with pytest.raises(ValueError):
+        require_format({})               # pre-versioned bundle -> v1
+
+
+def test_capture_restore_rng_roundtrip():
+    """The single seam both save_bundle and resume use: every captured
+    stream restores (hand-mirroring is how torch_cuda got missed once)."""
+    import numpy as np
+    from chase_train.checkpoint import capture_rng, restore_rng
+
+    class _Env:                          # minimal .unwrapped.np_random
+        np_random = np.random.default_rng(5)
+        unwrapped = None
+    env = _Env()
+    env.unwrapped = env
+    run_rng = np.random.default_rng(1)
+    diag_rng = np.random.default_rng(2)
+    run_rng.normal(size=7)
+    env.np_random.normal(size=3)
+    state = capture_rng(run_rng=run_rng, env=env, diag_rng=diag_rng,
+                        device=torch.device('cpu'))
+    expect = (run_rng.normal(), env.np_random.normal(), diag_rng.normal())
+
+    run2, diag2 = np.random.default_rng(9), np.random.default_rng(9)
+    env2 = _Env()
+    env2.unwrapped = env2
+    env2.np_random = np.random.default_rng(9)
+    restore_rng(state, run_rng=run2, env=env2, diag_rng=diag2)
+    got = (run2.normal(), env2.np_random.normal(), diag2.normal())
+    assert got == pytest.approx(expect)
+    assert state['torch_cuda'] is None   # cpu device: no CUDA context

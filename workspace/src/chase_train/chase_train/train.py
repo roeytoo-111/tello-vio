@@ -22,11 +22,13 @@ import gymnasium
 
 from chase_gym import ChaseEnv, EnvConfig, FaithfulPointMassEnv, PController
 from chase_gym.env import reward_config_from
-from chase_eval.evaluate import default_env_factory, run_suite
+from chase_eval.evaluate import (ActorPolicy, default_env_factory,
+                                 run_suite, selection_tv)
 
 from .buffer import ReplayBuffer, load_demos
-from .checkpoint import (export_onnx, load_bundle, save_bundle,
-                         update_best_manifest, versioned_name)
+from .checkpoint import (export_onnx, load_bundle, require_format,
+                         restore_rng, save_bundle, update_best_manifest,
+                         versioned_name)
 from .config import RunConfig, load as load_config
 from .networks import Actor, CriticEnsemble
 from .noise import GaussianNoise, OUNoise
@@ -193,29 +195,11 @@ def eval_faithful_actor(act_fn, episodes: int = 20,
 
 def eval_faithful(trainer: TD3, episodes: int = 20,
                   eval_seed0: int = 10_000) -> dict:
-    """Arm F is scored in its own world: return and survival, exploration
+    """Arm F scored in its own world: return and survival, exploration
     off (its 'time in view' is the fraction of the 10-step budget survived
-    before an edge exit)."""
-    env = gymnasium.wrappers.TimeLimit(FaithfulPointMassEnv(),
-                                       max_episode_steps=FAITHFUL_EPISODE_CAP)
-    rets, lens = [], []
-    for e in range(episodes):
-        obs, _ = env.reset(seed=eval_seed0 + e)
-        total, steps = 0.0, 0
-        while True:
-            a = trainer.act(np.asarray(obs, dtype=np.float32))
-            obs, r, term, trunc, _ = env.step(a)
-            total += r
-            steps += 1
-            if term or trunc:
-                break
-        rets.append(total)
-        lens.append(steps)
-    tv = float(np.mean(lens)) / FAITHFUL_EPISODE_CAP
-    return {'families': {}, 'aggregate': {
-        'return_mean': float(np.mean(rets)),
-        'time_in_view': tv, 'loss_rate': float('nan'),
-        'capture_rate': 0.0, 'mean_episode_len': float(np.mean(lens))}}
+    before an edge exit). One rollout-scoring body: this delegates."""
+    return eval_faithful_actor(trainer.act, episodes=episodes,
+                               eval_seed0=eval_seed0)
 
 
 def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
@@ -253,8 +237,13 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
     start_step = 0
     resumed_stage = 0
     if resume:
-        # The refusal is the contract (guide 19) -- also on resume.
+        # The refusals are the contract (guide 19) -- also on resume.
         bundle = load_bundle(resume, expect_obs_spec=obs_spec)
+        require_format(bundle)
+        if bundle.get('arm') != cfg.arm:
+            raise SystemExit(
+                f"refusing resume: bundle arm {bundle.get('arm')!r} != "
+                f"config arm {cfg.arm!r}")
         if bundle['env_step'] >= cfg.train.total_steps:
             raise SystemExit(
                 f"refusing resume: bundle env_step {bundle['env_step']} >= "
@@ -264,19 +253,6 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
         noise.load_state_dict(bundle['noise'])
         start_step = bundle['env_step']
         resumed_stage = max(0, int(bundle.get('curriculum_stage', 0)))
-        # Restore the RNG streams so the continued run is a continuation,
-        # not a replay of the stream from step 0.
-        rng_state = bundle.get('rng', {})
-        if rng_state.get('python') is not None:
-            random.setstate(rng_state['python'])
-        if rng_state.get('numpy_legacy') is not None:
-            np.random.set_state(rng_state['numpy_legacy'])
-        if rng_state.get('torch') is not None:
-            torch.set_rng_state(rng_state['torch'])
-        if rng_state.get('numpy_generator') is not None:
-            rng.bit_generator.state = rng_state['numpy_generator']
-        if rng_state.get('torch_cuda') is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
 
     # Prefill runs on fresh AND resumed runs: the buffer is not persisted
     # in the bundle, so a resume otherwise takes its first gradient steps
@@ -303,11 +279,17 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
 
     obs, _ = env.reset(seed=cfg.seed)
     if resume:
-        # Continue the env's own episode stream instead of replaying it
-        # from the seed (the bundle carries the env generator state).
-        env_rng = bundle['rng'].get('env_generator')
-        if env_rng is not None:
-            env.unwrapped.np_random.bit_generator.state = env_rng
+        # Restore every captured stream in one call (the checkpoint.py
+        # capture/restore pair is the single seam; hand-mirroring is how a
+        # stream got missed before). APPROXIMATE continuation, stated
+        # plainly: checkpoints save at eval boundaries mid-episode, the
+        # in-flight episode is dropped, and this reset consumes the next
+        # episode draw one step 'early' -- so a resumed run is a
+        # continuation of the streams, not a bit-exact replay of an
+        # uninterrupted one.
+        restore_rng(bundle.get('rng', {}), run_rng=rng, env=env,
+                    diag_rng=diag_rng)
+        if bundle.get('rng', {}).get('env_generator') is not None:
             obs, _ = env.reset()
     noise.reset_episode(rng)
     ep_ret, ep_len = 0.0, 0
@@ -347,11 +329,13 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
             batch = buf.sample(cfg.train.batch, rng)
             # Dashboard reductions only every 200 grad steps: they cost a
             # device sync each and are read once per eval.
-            # <=1: cover BOTH gradient-step parities, or with policy_delay=2
-            # the actor_loss row would never land on a metrics step.
+            # <=1 covers both gradient-step parities; MERGE (never
+            # replace) so the delay-step dict's actor_loss survives the
+            # actor-less dict computed on the other parity -- grad-step
+            # parity is decoupled from env-step parity by construction.
             m = trainer.update(batch, compute_metrics=(step % 200 <= 1))
             if m:
-                recent_update_metrics = m
+                recent_update_metrics.update(m)
 
         # ---- eval / checkpoint / curriculum / stopping ----
         if step % cfg.eval.every == 0 or step == cfg.train.total_steps:
@@ -368,6 +352,11 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                 curriculum.update(suite['families'])
 
             agg = suite['aggregate']
+            # Selection scores what acceptance judges (guide 28.4): the
+            # MOVING-family tv where families exist, the aggregate
+            # otherwise (faithful arm) -- else a checkpoint fat on static
+            # tv outcompetes one that would clear the P-controller bar.
+            sel_tv = selection_tv(suite)
             # avg_Q vs realised return -- the overestimation dashboard row.
             avg_q = float('nan')
             if len(buf) >= cfg.train.batch:
@@ -393,25 +382,26 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                   f"loss {agg['loss_rate'] if agg['loss_rate']==agg['loss_rate'] else float('nan'):.2f}  "
                   f"avgQ {avg_q:.2f}  stage {record['stage']}")
 
-            improved = (agg['time_in_view'] > best['tv'] + cfg.eval.plateau_epsilon
-                        or (abs(agg['time_in_view'] - best['tv']) <= cfg.eval.plateau_epsilon
+            improved = (sel_tv > best['tv'] + cfg.eval.plateau_epsilon
+                        or (abs(sel_tv - best['tv']) <= cfg.eval.plateau_epsilon
                             and agg['return_mean'] > best['ret']))
             if improved:
-                best = {'tv': agg['time_in_view'], 'ret': agg['return_mean']}
+                best = {'tv': sel_tv, 'ret': agg['return_mean']}
                 evals_since_best = 0
                 ckpt = os.path.join(run_dir, versioned_name(
-                    cfg.arm, cfg.seed, step, agg['time_in_view']))
+                    cfg.arm, cfg.seed, step, sel_tv))
                 save_bundle(
                     ckpt, trainer=trainer, noise=noise, cfg=cfg,
                     obs_spec=obs_spec, action_map=action_map(cfg),
                     env_config=env_config, env_step=step, eval_snapshot=agg,
                     curriculum_stage=record['stage'], run_rng=rng,
-                    env_rng_state=env.unwrapped.np_random.bit_generator.state)
+                    env=env, diag_rng=diag_rng)
                 update_best_manifest(run_dir, {
                     'arm': cfg.arm, 'seed': cfg.seed, 'path': ckpt,
-                    'env_step': step, 'time_in_view': agg['time_in_view'],
+                    'env_step': step, 'selection_tv': sel_tv,
+                    'time_in_view': agg['time_in_view'],
                     'return_mean': agg['return_mean'],
-                    'reason': 'best eval time-in-view'})
+                    'reason': 'best moving-family eval time-in-view'})
             else:
                 evals_since_best += 1
 
@@ -428,30 +418,30 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
     # they must describe the best-selected checkpoint, which is what ships,
     # not whatever weights the plateau stop left in memory.
     heldout_seed0 = cfg.eval.eval_seed0 + 500_000
-    heldout_actor = trainer.act
+    heldout_get = trainer.act
     heldout_subject = 'final weights (no best checkpoint saved)'
     best_path = os.path.join(run_dir, 'best.json')
+    best_bundle = None
     if os.path.exists(best_path):
         from .checkpoint import actor_from_bundle
         with open(best_path) as f:
             best_entry = json.load(f)
-        _best_actor = actor_from_bundle(load_bundle(best_entry['path']))
-
-        def heldout_actor(o):
-            with torch.no_grad():
-                t = torch.as_tensor(o, dtype=torch.float32).unsqueeze(0)
-                return _best_actor(t).squeeze(0).numpy()
-        heldout_subject = os.path.basename(best_entry['path'])
+        try:
+            best_bundle = load_bundle(best_entry['path'])
+            heldout_get = ActorPolicy(
+                actor_from_bundle(best_bundle)).get_action
+            heldout_subject = os.path.basename(best_entry['path'])
+        except Exception as e:      # a vanished/corrupt file must not
+            print(f'[held-out] WARNING: best checkpoint unreadable '
+                  f'({e}); reporting final weights instead')
+            heldout_subject = f'final weights (best unreadable)'
     if faithful:
-        heldout = eval_faithful(trainer,
-                                episodes=cfg.eval.episodes_per_scenario,
-                                eval_seed0=heldout_seed0) \
-            if not os.path.exists(best_path) else eval_faithful_actor(
-                heldout_actor, episodes=cfg.eval.episodes_per_scenario,
-                eval_seed0=heldout_seed0)
+        heldout = eval_faithful_actor(
+            heldout_get, episodes=cfg.eval.episodes_per_scenario,
+            eval_seed0=heldout_seed0)
     else:
         heldout = run_suite(
-            heldout_actor, eval_env_factory,
+            heldout_get, eval_env_factory,
             episodes_per_family=cfg.eval.episodes_per_scenario,
             eval_seed0=heldout_seed0)
     with open(metrics_path, 'a') as f:
@@ -470,13 +460,10 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                 env_config=env_config, env_step=step,
                 eval_snapshot={'selection': best, 'heldout': ha},
                 curriculum_stage=curriculum.stage if curriculum else -1,
-                run_rng=rng,
-                env_rng_state=env.unwrapped.np_random.bit_generator.state)
-    if os.path.exists(best_path):
-        with open(best_path) as f:
-            best_entry = json.load(f)
+                run_rng=rng, env=env, diag_rng=diag_rng)
+    if best_bundle is not None:
         onnx_path = export_onnx(
-            load_bundle(best_entry['path']),
+            best_bundle,
             os.path.splitext(best_entry['path'])[0] + '.onnx')
         if onnx_path:
             print(f'[export] ONNX actor: {onnx_path} (parity checked)')

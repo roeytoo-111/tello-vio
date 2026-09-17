@@ -25,6 +25,8 @@ setup(
         'console_scripts': [
             'train = chase_train.train:main',
             'run_matrix = chase_train.run_matrix:main',
+            'report_matrix = chase_train.report_matrix:main',
+            'sb3_check = chase_train.sb3_check:main',
         ],
     },
 )

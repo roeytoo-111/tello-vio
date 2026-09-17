@@ -29,6 +29,7 @@ gz-transport13 sources, 2026-09-17; see sim_implementation_map.md):
     pose/info.
 """
 import math
+import os
 import subprocess
 import threading
 import time
@@ -52,6 +53,18 @@ class GzBackendBase:
     (real gz-sim server) and FakeGzBackend (kinematic double for tests)."""
 
     physics_dt: float = 0.001
+    # OdometryPublisher period (sim time) in the generated world; steps
+    # shorter than this guarantee no fresh pose and are refused by BOTH
+    # backends -- the fake enforces the caller contract the real one needs.
+    ODOM_PERIOD_S = 0.010
+
+    def check_step_span(self, iterations: int) -> None:
+        span = iterations * self.physics_dt
+        if span < self.ODOM_PERIOD_S:
+            raise ValueError(
+                f'step of {span * 1000:.0f} ms is shorter than the odom '
+                f'publish period ({self.ODOM_PERIOD_S * 1000:.0f} ms): no '
+                f'fresh pose is guaranteed -- step at least one period')
 
     def start(self) -> None: ...
     def stop(self) -> None: ...
@@ -97,7 +110,6 @@ class GzTransportBackend(GzBackendBase):
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
-        import os
         env = dict(os.environ)
         if self.partition:
             env['GZ_PARTITION'] = self.partition
@@ -133,7 +145,7 @@ class GzTransportBackend(GzBackendBase):
             def make_cb(name):
                 def on_odom(msg: Odometry):
                     q = msg.pose.orientation
-                    self._odom[name] = OdomSample(
+                    sample = OdomSample(
                         t_sim=(msg.header.stamp.sec
                                + msg.header.stamp.nsec * 1e-9),
                         pos=np.array([msg.pose.position.x,
@@ -144,6 +156,9 @@ class GzTransportBackend(GzBackendBase):
                                            msg.twist.linear.y,
                                            msg.twist.linear.z]),
                         yaw_rate=msg.twist.angular.z)
+                    with self._clock_cv:
+                        self._odom[name] = sample
+                        self._clock_cv.notify_all()
                 return on_odom
             if not self._node.subscribe(Odometry, f'/model/{model}/odometry',
                                         make_cb(model)):
@@ -158,6 +173,12 @@ class GzTransportBackend(GzBackendBase):
         with self._clock_cv:
             while self._sim_time == 0.0 and time.time() < deadline:
                 self._clock_cv.wait(0.5)
+            if self._sim_time == 0.0:
+                # A silent fall-through here poisons everything downstream
+                # (reset_world would read pre=0 on a live server).
+                raise TimeoutError(
+                    f'gz server produced no clock within {timeout_s}s -- '
+                    f'is {self.world_sdf} loadable?')
         # Pause immediately: lockstep owns the clock from here on.
         self._control(pause=True)
 
@@ -211,34 +232,36 @@ class GzTransportBackend(GzBackendBase):
                         f'lockstep: sim time {self._sim_time:.4f} never '
                         f'reached {target:.4f}')
                 self._clock_cv.wait(min(remaining, 0.5))
-        # Freshness bound: a step spanning >= one odom period GUARANTEES a
-        # publish inside it, so demand a stamp strictly after the step
-        # started -- a target-relative slack would accept pre-step (e.g.
-        # pre-teleport) poses on short settle steps. Shorter steps cannot
-        # guarantee a fresh sample; fall back to the target-relative bound.
-        if iterations * self.physics_dt >= self.ODOM_PERIOD_S:
-            want = start + 0.25 * self.physics_dt
-        else:
-            want = target - 1.5 * self.ODOM_PERIOD_S
+        # Freshness bound, both invariants at once: the sample must be
+        # POST-START (a pre-step/pre-teleport pose must never satisfy the
+        # wait) AND NEAR-TARGET (accepting the step's first odom would
+        # leave truth up to a whole control period stale and let the two
+        # models pair time-skewed samples). max() enforces both; steps
+        # shorter than one publish period cannot guarantee any fresh
+        # sample and are refused outright rather than served stale data.
+        self.check_step_span(iterations)
+        want = max(start + 0.25 * self.physics_dt,
+                   target - 1.5 * self.ODOM_PERIOD_S)
         self._wait_odoms(want, deadline)
 
-    # OdometryPublisher runs at 100 Hz SIM time (world SDF), so the newest
-    # sample can lag the step boundary by at most one period.
-    ODOM_PERIOD_S = 0.010
-
     def _wait_odoms(self, want: float, deadline: float) -> None:
-        while True:
-            stale = [m for m in self.models
-                     if self._odom.get(m) is None
-                     or self._odom[m].t_sim < want]
-            if not stale:
-                return
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f'odometry for {stale} never reached sim time '
-                    f'{want:.3f} (have: '
-                    f'{ {m: getattr(self._odom.get(m), "t_sim", None) for m in stale} })')
-            time.sleep(0.001)
+        # The odom callbacks notify the same condition variable as the
+        # clock, so this waits instead of sleep-polling (a 1 ms poll tax
+        # on every lockstep step adds real minutes over a fine-tune run).
+        with self._clock_cv:
+            while True:
+                stale = [m for m in self.models
+                         if self._odom.get(m) is None
+                         or self._odom[m].t_sim < want]
+                if not stale:
+                    return
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f'odometry for {stale} never reached sim time '
+                        f'{want:.3f} (have: '
+                        f'{ {m: getattr(self._odom.get(m), "t_sim", None) for m in stale} })')
+                self._clock_cv.wait(min(remaining, 0.5))
 
     def reset_world(self) -> None:
         pre = self.sim_time()
@@ -335,6 +358,7 @@ class FakeGzBackend(GzBackendBase):
         self._cmd[model] = (tuple(map(float, lin_body)), float(yaw_rate))
 
     def step(self, iterations: int) -> None:
+        self.check_step_span(iterations)
         dt = self.physics_dt
         alpha = min(dt / self.response_tau, 1.0)
         for _ in range(iterations):
@@ -362,9 +386,9 @@ class FakeGzBackend(GzBackendBase):
 # ---- shared script plumbing (sign_test, calibrate_lag, ab_replay_gate,
 # ---- finetune all take the same backend choice) --------------------------
 
-DEFAULT_WORLD = __import__('os').path.join(
-    __import__('os').path.dirname(__import__('os').path.dirname(
-        __import__('os').path.abspath(__file__))), 'worlds', 'chase.sdf')
+DEFAULT_WORLD = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'worlds', 'chase.sdf')
 
 
 def add_backend_args(ap) -> None:
@@ -381,7 +405,6 @@ def add_backend_args(ap) -> None:
 def make_backend(args, **fake_kwargs) -> GzBackendBase:
     if args.fake:
         return FakeGzBackend(**fake_kwargs)
-    import os as _os
-    partition = args.partition or f'chase-{_os.getpid()}'
+    partition = args.partition or f'chase-{os.getpid()}'
     return GzTransportBackend(args.world or DEFAULT_WORLD,
                               partition=partition)
