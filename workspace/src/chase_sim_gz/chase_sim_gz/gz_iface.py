@@ -1,0 +1,307 @@
+"""The ONLY file that speaks gz-transport -- everything else talks to this
+interface, which is what makes Tier B testable on a machine without gz-sim
+and swappable if the transport API moves.
+
+Verified API facts this file is built on (all read from gz-sim8/gz-msgs10/
+gz-transport13 sources, 2026-09-17; see sim_implementation_map.md):
+
+  * Python bindings: `from gz.transport13 import Node`,
+    `from gz.msgs10.<x>_pb2 import <X>`; `node.request(service, req,
+    ReqType, RespType, timeout_ms) -> (ok, resp)`;
+    `node.subscribe(MsgType, topic, cb)`.
+  * Lockstep: `/world/<w>/control` takes gz.msgs.WorldControl; the correct
+    request is {pause: true, multi_step: N} -- pause:false + multi_step
+    FREE-RUNS. The service returns IMMEDIATELY (the command is queued);
+    completion must be detected from `/world/<w>/clock` (gz.msgs.Clock,
+    published every loop iteration, NOT throttled) -- `/world/<w>/stats`
+    is throttled to 10 msgs/s wall-clock and pose/info to 60/s wall-clock,
+    both useless at high real-time factors.
+  * Reset: {pause: true, reset: {all: true}}; systems without ISystemReset
+    (MulticopterVelocityControl, MulticopterMotorModel) are destroyed and
+    re-Configured -- clean, but the controller then waits for a FIRST
+    Twist before publishing rotor velocities: re-send a command after
+    reset.
+  * set_pose: `/world/<w>/set_pose` (gz.msgs.Pose in, Boolean out),
+    provided by the UserCommands system, QUEUED -- executed on the next
+    PreUpdate, so flush with a small step.
+  * OdometryPublisher output `/model/<name>/odometry` (gz.msgs.Odometry)
+    is throttled in SIM time -- deterministic under lockstep, unlike
+    pose/info.
+"""
+import math
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple
+
+import numpy as np
+
+
+@dataclass
+class OdomSample:
+    t_sim: float
+    pos: np.ndarray                   # world xyz
+    yaw: float
+    lin_body: np.ndarray              # body-frame linear velocity
+    yaw_rate: float
+
+
+class GzBackendBase:
+    """The contract GzChaseEnv drives. Implementations: GzTransportBackend
+    (real gz-sim server) and FakeGzBackend (kinematic double for tests)."""
+
+    physics_dt: float = 0.001
+
+    def start(self) -> None: ...
+    def stop(self) -> None: ...
+    def reset_world(self) -> None: ...
+    def set_pose(self, model: str, pos, yaw: float) -> None: ...
+    def send_twist(self, model: str, lin_body, yaw_rate: float) -> None: ...
+    def step(self, iterations: int) -> None: ...
+    def sim_time(self) -> float: ...
+    def get_odom(self, model: str) -> Optional[OdomSample]: ...
+
+
+def quat_to_yaw(w: float, x: float, y: float, z: float) -> float:
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+class GzTransportBackend(GzBackendBase):
+    """Drives a headless `gz sim -s` server over gz-transport13. One backend
+    per server; concurrent instances isolate with GZ_PARTITION."""
+
+    def __init__(self, world_sdf: str, world_name: str = 'chase',
+                 models: Tuple[str, ...] = ('follower', 'target'),
+                 partition: Optional[str] = None,
+                 server_cmd: str = 'gz sim -s -r',
+                 request_timeout_ms: int = 2000,
+                 step_timeout_s: float = 30.0):
+        self.world_sdf = world_sdf
+        self.world_name = world_name
+        self.models = models
+        self.partition = partition
+        self.server_cmd = server_cmd
+        self.request_timeout_ms = request_timeout_ms
+        self.step_timeout_s = step_timeout_s
+        self._proc: Optional[subprocess.Popen] = None
+        self._node = None
+        self._pubs: Dict[str, object] = {}
+        self._odom: Dict[str, OdomSample] = {}
+        self._sim_time = 0.0
+        self._paused = True
+        self._clock_cv = threading.Condition()
+        self._WorldControl = None
+        self._Boolean = None
+        self._Pose = None
+
+    # -- lifecycle --------------------------------------------------------
+    def start(self) -> None:
+        import os
+        env = dict(os.environ)
+        if self.partition:
+            env['GZ_PARTITION'] = self.partition
+        cmd = self.server_cmd.split() + [self.world_sdf]
+        self._proc = subprocess.Popen(cmd, env=env,
+                                      stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL)
+        if self.partition:
+            os.environ['GZ_PARTITION'] = self.partition
+
+        from gz.transport13 import Node
+        from gz.msgs10.world_control_pb2 import WorldControl
+        from gz.msgs10.boolean_pb2 import Boolean
+        from gz.msgs10.pose_pb2 import Pose
+        from gz.msgs10.clock_pb2 import Clock
+        from gz.msgs10.odometry_pb2 import Odometry
+        from gz.msgs10.twist_pb2 import Twist
+        self._WorldControl, self._Boolean, self._Pose = WorldControl, Boolean, Pose
+        self._Twist = Twist
+        self._node = Node()
+
+        def on_clock(msg: Clock):
+            with self._clock_cv:
+                self._sim_time = msg.sim.sec + msg.sim.nsec * 1e-9
+                self._clock_cv.notify_all()
+
+        ok = self._node.subscribe(Clock, f'/world/{self.world_name}/clock',
+                                  on_clock)
+        if not ok:
+            raise RuntimeError('failed to subscribe world clock')
+
+        for model in self.models:
+            def make_cb(name):
+                def on_odom(msg: Odometry):
+                    q = msg.pose.orientation
+                    self._odom[name] = OdomSample(
+                        t_sim=(msg.header.stamp.sec
+                               + msg.header.stamp.nsec * 1e-9),
+                        pos=np.array([msg.pose.position.x,
+                                      msg.pose.position.y,
+                                      msg.pose.position.z]),
+                        yaw=quat_to_yaw(q.w, q.x, q.y, q.z),
+                        lin_body=np.array([msg.twist.linear.x,
+                                           msg.twist.linear.y,
+                                           msg.twist.linear.z]),
+                        yaw_rate=msg.twist.angular.z)
+                return on_odom
+            if not self._node.subscribe(Odometry, f'/model/{model}/odometry',
+                                        make_cb(model)):
+                raise RuntimeError(f'failed to subscribe odometry of {model}')
+            self._pubs[model] = self._node.advertise(
+                f'/{model}/cmd_vel', Twist)
+
+        self._wait_for_server()
+
+    def _wait_for_server(self, timeout_s: float = 20.0) -> None:
+        deadline = time.time() + timeout_s
+        with self._clock_cv:
+            while self._sim_time == 0.0 and time.time() < deadline:
+                self._clock_cv.wait(0.5)
+        # Pause immediately: lockstep owns the clock from here on.
+        self._control(pause=True)
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            self._proc = None
+
+    # -- control ----------------------------------------------------------
+    def _control(self, pause: Optional[bool] = None, multi_step: int = 0,
+                 reset_all: bool = False) -> None:
+        req = self._WorldControl()
+        if pause is not None:
+            req.pause = pause
+        if multi_step:
+            req.multi_step = multi_step
+        if reset_all:
+            req.reset.all = True
+        ok, resp = self._node.request(
+            f'/world/{self.world_name}/control', req, self._WorldControl,
+            self._Boolean, self.request_timeout_ms)
+        if not (ok and resp.data):
+            raise RuntimeError(
+                f'world control failed (pause={pause}, step={multi_step}, '
+                f'reset={reset_all})')
+
+    def step(self, iterations: int) -> None:
+        """Lockstep: {pause: true, multi_step: N}, then wait on the
+        unthrottled world clock until sim time reaches the target."""
+        target = self.sim_time() + iterations * self.physics_dt
+        self._control(pause=True, multi_step=iterations)
+        deadline = time.time() + self.step_timeout_s
+        with self._clock_cv:
+            while self._sim_time < target - 0.25 * self.physics_dt:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f'lockstep: sim time {self._sim_time:.4f} never '
+                        f'reached {target:.4f}')
+                self._clock_cv.wait(min(remaining, 0.5))
+
+    def reset_world(self) -> None:
+        self._control(pause=True, reset_all=True)
+        # The rewind applies on the next loop iteration while paused; give
+        # the server a moment, then confirm by stepping once and re-arming
+        # the (re-Configured) controllers with a zero command.
+        time.sleep(0.05)
+        self._sim_time = 0.0
+        for model in self.models:
+            self.send_twist(model, (0.0, 0.0, 0.0), 0.0)
+        self.step(1)
+
+    def set_pose(self, model: str, pos, yaw: float) -> None:
+        req = self._Pose()
+        req.name = model
+        req.position.x, req.position.y, req.position.z = map(float, pos)
+        req.orientation.w = math.cos(yaw / 2.0)
+        req.orientation.z = math.sin(yaw / 2.0)
+        ok, resp = self._node.request(
+            f'/world/{self.world_name}/set_pose', req, self._Pose,
+            self._Boolean, self.request_timeout_ms)
+        if not (ok and resp.data):
+            raise RuntimeError(f'set_pose({model}) refused')
+        # Queued by UserCommands: takes effect on the next PreUpdate.
+
+    def send_twist(self, model: str, lin_body, yaw_rate: float) -> None:
+        msg = self._Twist()
+        msg.linear.x, msg.linear.y, msg.linear.z = map(float, lin_body)
+        msg.angular.z = float(yaw_rate)
+        self._pubs[model].publish(msg)
+
+    def sim_time(self) -> float:
+        with self._clock_cv:
+            return self._sim_time
+
+    def get_odom(self, model: str) -> Optional[OdomSample]:
+        return self._odom.get(model)
+
+
+class FakeGzBackend(GzBackendBase):
+    """Kinematic double of the gz world: two 'multicopters' whose achieved
+    body velocity follows the commanded twist through a first-order lag
+    (what MulticopterVelocityControl produces at Tier-A fidelity),
+    integrated at the physics step. Exercises every line of GzChaseEnv --
+    lockstep bookkeeping, oracle, latency shim -- without a gz install.
+    The REAL backend is exercised by sign_test.py after
+    scripts/install_gz_harmonic.sh."""
+
+    def __init__(self, models: Tuple[str, ...] = ('follower', 'target'),
+                 response_tau: float = 0.15):
+        self.models = models
+        self.response_tau = response_tau
+        self._t = 0.0
+        self._state: Dict[str, dict] = {}
+        self._cmd: Dict[str, tuple] = {}
+        self.reset_world()
+
+    def start(self) -> None:
+        pass
+
+    def stop(self) -> None:
+        pass
+
+    def reset_world(self) -> None:
+        self._t = 0.0
+        self._state = {m: {'pos': np.zeros(3), 'yaw': 0.0,
+                           'v_body': np.zeros(3), 'yaw_rate': 0.0}
+                       for m in self.models}
+        self._cmd = {m: ((0.0, 0.0, 0.0), 0.0) for m in self.models}
+
+    def set_pose(self, model: str, pos, yaw: float) -> None:
+        st = self._state[model]
+        st['pos'] = np.asarray(pos, dtype=float).copy()
+        st['yaw'] = float(yaw)
+        st['v_body'] = np.zeros(3)
+        st['yaw_rate'] = 0.0
+
+    def send_twist(self, model: str, lin_body, yaw_rate: float) -> None:
+        self._cmd[model] = (tuple(map(float, lin_body)), float(yaw_rate))
+
+    def step(self, iterations: int) -> None:
+        dt = self.physics_dt
+        alpha = min(dt / self.response_tau, 1.0)
+        for _ in range(iterations):
+            for m, st in self._state.items():
+                cmd_lin, cmd_yaw = self._cmd[m]
+                st['v_body'] += alpha * (np.asarray(cmd_lin) - st['v_body'])
+                st['yaw_rate'] += alpha * (cmd_yaw - st['yaw_rate'])
+                cy, sy = math.cos(st['yaw']), math.sin(st['yaw'])
+                vx, vy, vz = st['v_body']
+                st['pos'] += np.array([cy * vx - sy * vy,
+                                       sy * vx + cy * vy, vz]) * dt
+                st['yaw'] += st['yaw_rate'] * dt
+            self._t += dt
+
+    def sim_time(self) -> float:
+        return self._t
+
+    def get_odom(self, model: str) -> Optional[OdomSample]:
+        st = self._state[model]
+        return OdomSample(t_sim=self._t, pos=st['pos'].copy(),
+                          yaw=st['yaw'], lin_body=st['v_body'].copy(),
+                          yaw_rate=st['yaw_rate'])

@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>chase_sim_gz</name>
+  <version>0.1.0</version>
+  <description>
+    Tier B: Gazebo gz-sim Harmonic lockstep simulation
+    (sim_training_architecture.md section 3). GzChaseEnv steps the world
+    100 x 1 ms per control period over gz-transport (WorldControl
+    multi-step, completion detected on the unthrottled world clock);
+    tello_sim_shim speaks the Tello stick contract with the driver's
+    0.35 s dead-man; sim_oracle_detector projects ground truth through
+    OUR camera calibration into chase_msgs/DroneDetection; latency_shim
+    delays it by the measured 150-350 ms on sim time. The world SDF is
+    generated (gen_world.py) with Tello-parameterised multicopter
+    plugins; sign_test.py and calibrate_lag.py implement the mandatory
+    3.2 protocol (gz yaw-sign issue #2657 is open upstream).
+
+    gz-sim Harmonic + ros-humble-ros-gzharmonic install via
+    scripts/install_gz_harmonic.sh (no rosdep keys for the osrf-hosted
+    packages); the FakeGzBackend covers CI without a gz install.
+  </description>
+  <maintainer email="roey.turgeman@aerosentry.tech">Roey Turgeman</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>chase_msgs</exec_depend>
+  <exec_depend>chase_gym</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

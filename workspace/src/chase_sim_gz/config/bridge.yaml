@@ -1,0 +1,41 @@
+# ros_gz parameter_bridge config for Tier B (verified key names + type
+# strings from the ros_gz humble branch README, 2026-09-17; the gzharmonic
+# factories accept the gz.msgs.* prefix).
+#
+#   ros2 run ros_gz_bridge parameter_bridge --ros-args -p config_file:=<this>
+#
+# Naming: the shim publishes METRIC body-frame velocities on
+# /<model>/cmd_vel_metric (ROS); the bridge maps them onto the gz topic
+# /<model>/cmd_vel that MulticopterVelocityControl subscribes
+# (robotNamespace=<model>, commandSubTopic=cmd_vel in the world SDF).
+- ros_topic_name: /follower/cmd_vel_metric
+  gz_topic_name: /follower/cmd_vel
+  ros_type_name: geometry_msgs/msg/Twist
+  gz_type_name: gz.msgs.Twist
+  direction: ROS_TO_GZ
+
+- ros_topic_name: /target/cmd_vel_metric
+  gz_topic_name: /target/cmd_vel
+  ros_type_name: geometry_msgs/msg/Twist
+  gz_type_name: gz.msgs.Twist
+  direction: ROS_TO_GZ
+
+- ros_topic_name: /model/follower/odometry
+  gz_topic_name: /model/follower/odometry
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+
+- ros_topic_name: /model/target/odometry
+  gz_topic_name: /model/target/odometry
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+
+# Sim time for every node launched with use_sim_time (the latency shim's
+# queue and the oracle's stamps live on this clock).
+- ros_topic_name: /clock
+  gz_topic_name: /world/chase/clock
+  ros_type_name: rosgraph_msgs/msg/Clock
+  gz_type_name: gz.msgs.Clock
+  direction: GZ_TO_ROS

@@ -88,6 +88,26 @@ class EnvConfig:
         return (2.0, 6.0) if self.task == 'intercept' else (1.5, 2.5)
 
 
+def forward_command(cfg: EnvConfig, meas) -> float:
+    """The hand-coded forward-axis law, shared by every tier (Tier B's
+    GzChaseEnv imports THIS function): metric standoff for FOLLOW, bounded
+    closing law with a floor speed for INTERCEPT -- both on the DELAYED
+    measurement, exactly like the deployed depth rule [D-impl 9/10]."""
+    if meas is None or meas.w_px <= 0:
+        return 0.0
+    d_est = C.FX * cfg.ref_width_m / meas.w_px       # pinhole range
+    if cfg.task == 'intercept':
+        if d_est <= cfg.r_cap_m:
+            return 0.0                   # inside: let the terminal fire
+        return float(np.clip(cfg.close_gain * (d_est - cfg.r_cap_m),
+                             cfg.v_close_min, cfg.v_close_max))
+    err = d_est - cfg.standoff_m
+    if abs(err) < cfg.standoff_deadband_m:
+        return 0.0
+    return float(np.clip(cfg.standoff_gain * err,
+                         -cfg.v_fwd_max, cfg.v_fwd_max))
+
+
 class ChaseEnv(gym.Env):
     metadata = {'render_modes': []}
 
@@ -150,6 +170,19 @@ class ChaseEnv(gym.Env):
         rng = self.np_random
         cfg = self.cfg
 
+        # DRAW ORDER CONTRACT: placement first, then family, then the
+        # tier-specific draws. GzChaseEnv consumes its stream in the SAME
+        # order, so one seed means one initial geometry in every tier --
+        # the A<->B replay gate depends on this (chase_sim_gz).
+        # Place the target: range from the operating band, box centre
+        # uniform inside the margin rectangle, back-projected (guide 16.3).
+        r_lo, r_hi = cfg.resolved_reset_range()
+        z_cam = rng.uniform(r_lo, r_hi)
+        m = cfg.reset_frame_margin
+        u0 = rng.uniform(C.FRAME_W * m, C.FRAME_W * (1.0 - m))
+        v0 = rng.uniform(C.FRAME_H * m, C.FRAME_H * (1.0 - m))
+        family = str(rng.choice(list(self._stage_families)))
+
         # Episode draws: lag jitter, latency base (guide 16.1 lines 2, 5).
         jitter = rng.uniform(-cfg.t_lag_jitter, cfg.t_lag_jitter)
         self._t_lag_ep = cfg.t_lag * (1.0 + jitter)
@@ -160,13 +193,6 @@ class ChaseEnv(gym.Env):
         self._assembler.reset()
         self._queue.clear()
 
-        # Place the target: range from the operating band, box centre
-        # uniform inside the margin rectangle, back-projected (guide 16.3).
-        r_lo, r_hi = cfg.resolved_reset_range()
-        z_cam = rng.uniform(r_lo, r_hi)
-        m = cfg.reset_frame_margin
-        u0 = rng.uniform(C.FRAME_W * m, C.FRAME_W * (1.0 - m))
-        v0 = rng.uniform(C.FRAME_H * m, C.FRAME_H * (1.0 - m))
         x_cam = (u0 - C.CX) * z_cam / C.FX
         y_cam = (v0 - C.CY) * z_cam / C.FY
         # camera -> body -> world (yaw = 0 at reset; see kinematics.py).
@@ -174,7 +200,6 @@ class ChaseEnv(gym.Env):
         target_pos = self._follower.state.pos + body
         target_pos[2] = max(target_pos[2], 0.2)   # stay above the floor
 
-        family = str(rng.choice(list(self._stage_families)))
         self._target = target_motion.make(family, rng, target_pos,
                                           self._stage_cap)
         self._family = family
@@ -273,20 +298,7 @@ class ChaseEnv(gym.Env):
         return self._corruption.apply(payload, rng)
 
     def _forward_command(self, meas: Optional[Measurement]) -> float:
-        cfg = self.cfg
-        if meas is None or meas.w_px <= 0:
-            return 0.0
-        d_est = C.FX * cfg.ref_width_m / meas.w_px   # pinhole range
-        if cfg.task == 'intercept':
-            if d_est <= cfg.r_cap_m:
-                return 0.0                   # inside: let the terminal fire
-            return float(np.clip(cfg.close_gain * (d_est - cfg.r_cap_m),
-                                 cfg.v_close_min, cfg.v_close_max))
-        err = d_est - cfg.standoff_m
-        if abs(err) < cfg.standoff_deadband_m:
-            return 0.0
-        return float(np.clip(cfg.standoff_gain * err,
-                             -cfg.v_fwd_max, cfg.v_fwd_max))
+        return forward_command(self.cfg, meas)
 
     def _info(self, u, v, w_px, in_frame, detected, range_m) -> dict:
         return {
