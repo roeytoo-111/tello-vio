@@ -1,0 +1,36 @@
+{
+  "SettingsVersion": 1.2,
+  "SimMode": "Multirotor",
+  "ViewMode": "NoDisplay",
+  "ClockSpeed": 1.0,
+  "CameraDefaults": {
+    "CaptureSettings": [
+      {
+        "ImageType": 0,
+        "Width": 960,
+        "Height": 720,
+        "FOV_Degrees": 55.1,
+        "MotionBlurAmount": 0.0,
+        "TargetGamma": 1.0
+      },
+      {
+        "ImageType": 5,
+        "Width": 960,
+        "Height": 720,
+        "FOV_Degrees": 55.1
+      }
+    ]
+  },
+  "SegmentationSettings": {
+    "InitMethod": "None",
+    "OverrideExisting": true
+  },
+  "Vehicles": {
+    "Follower": {
+      "VehicleType": "SimpleFlight",
+      "X": 0.0,
+      "Y": 0.0,
+      "Z": -1.0
+    }
+  }
+}

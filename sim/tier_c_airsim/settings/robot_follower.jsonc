@@ -1,0 +1,46 @@
+// Project AirSim robot config for the follower (verified key names from
+// docs/sensors/camera_capture_settings.md, 2026-09-17). Start from the
+// shipped robot_quadrotor_fastphysics.jsonc and REPLACE its camera with
+// this one: the capture geometry must be the REAL Tello camera's
+// (960 x 720, H-FOV 55.1 deg from our ost.txt calibration) -- the policy
+// lives in that geometry, never the renderer's default.
+//
+// The annotation settings give exact 2D boxes for the target in every
+// image message -- the dataset factory's label source (no segmentation
+// mask step needed on this engine).
+{
+  "physics-type": "fast-physics",
+  "sensors": [
+    {
+      "id": "FrontCamera",
+      "type": "camera",
+      "parent-link": "Frame",
+      "capture-interval": 0.1,
+      "capture-settings": [
+        {
+          "image-type": 0,
+          "width": 960,
+          "height": 720,
+          "fov-degrees": 55.1,
+          "capture-enabled": true,
+          "streaming-enabled": false,
+          "pixels-as-float": false,
+          "compress": false
+        },
+        {
+          "image-type": 3,
+          "width": 960,
+          "height": 720,
+          "fov-degrees": 55.1,
+          "capture-enabled": true,
+          "streaming-enabled": false
+        }
+      ],
+      "annotation-settings": {
+        "enabled": true,
+        "object-ids": ["TargetTello"],
+        "bbox2D-settings": { "alignment": "axis" }
+      }
+    }
+  ]
+}
