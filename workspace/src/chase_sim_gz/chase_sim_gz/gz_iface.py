@@ -27,16 +27,70 @@ gz-transport13 sources, 2026-09-17; see sim_implementation_map.md):
   * OdometryPublisher output `/model/<name>/odometry` (gz.msgs.Odometry)
     is throttled in SIM time -- deterministic under lockstep, unlike
     pose/info.
+
+Measured against a live gz-sim 8.15 server (2026-09-17), not read:
+
+  * `Node.request_raw` blocks WITHOUT releasing the GIL. Once the process
+    holds any subscription, the transport thread delivering the reply is
+    stuck acquiring the GIL for a callback, so every request times out
+    (ok=False) even though the server executed it -- a multi_step still
+    advanced sim time. Service calls therefore go through a spawned helper
+    process whose Node never subscribes (_REQUEST_WORKER_SRC).
+  * The apt gz.msgs10 _pb2 files predate protoc 3.19; a pip protobuf >= 4
+    (onnx pulls one into ~/.local) refuses them unless the pure-Python
+    implementation is selected before google.protobuf is first imported.
 """
 import math
 import os
+import pickle
+import struct
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from importlib import metadata
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+
+def ensure_protobuf_compat() -> None:
+    try:
+        major = int(metadata.version('protobuf').split('.')[0])
+    except (metadata.PackageNotFoundError, ValueError):
+        return
+    if major < 4:
+        return
+    impl = os.environ.get('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION')
+    if impl == 'python':
+        return
+    if 'google.protobuf' in sys.modules:
+        raise RuntimeError(
+            f'protobuf {major}.x was imported before gz.msgs10 and cannot '
+            f'load its _pb2 files; export '
+            f'PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python before starting '
+            f'Python')
+    os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
+
+
+# Run with `python -c`, not multiprocessing: spawn re-imports the caller's
+# __main__, which breaks any unguarded script, and fork is unsafe once torch
+# or gz-transport threads exist.
+_REQUEST_WORKER_SRC = r'''
+import pickle, struct, sys
+from gz.transport13 import Node
+node = Node()
+rd, wr = sys.stdin.buffer, sys.stdout.buffer
+while True:
+    head = rd.read(4)
+    if len(head) < 4:
+        break
+    item = pickle.loads(rd.read(struct.unpack("<I", head)[0]))
+    out = pickle.dumps(node.request_raw(*item))
+    wr.write(struct.pack("<I", len(out)) + out)
+    wr.flush()
+'''
 
 
 @dataclass
@@ -98,6 +152,7 @@ class GzTransportBackend(GzBackendBase):
         self.request_timeout_ms = request_timeout_ms
         self.step_timeout_s = step_timeout_s
         self._proc: Optional[subprocess.Popen] = None
+        self._req_proc: Optional[subprocess.Popen] = None
         self._node = None
         self._pubs: Dict[str, object] = {}
         self._odom: Dict[str, OdomSample] = {}
@@ -110,6 +165,13 @@ class GzTransportBackend(GzBackendBase):
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
+        try:
+            self._start()
+        except BaseException:
+            self.stop()          # never orphan a server the caller can't see
+            raise
+
+    def _start(self) -> None:
         env = dict(os.environ)
         if self.partition:
             env['GZ_PARTITION'] = self.partition
@@ -119,6 +181,11 @@ class GzTransportBackend(GzBackendBase):
                                       stderr=subprocess.DEVNULL)
         if self.partition:
             os.environ['GZ_PARTITION'] = self.partition
+        ensure_protobuf_compat()
+
+        self._req_proc = subprocess.Popen(
+            [sys.executable, '-c', _REQUEST_WORKER_SRC],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
         from gz.transport13 import Node
         from gz.msgs10.world_control_pb2 import WorldControl
@@ -183,6 +250,13 @@ class GzTransportBackend(GzBackendBase):
         self._control(pause=True)
 
     def stop(self) -> None:
+        if self._req_proc is not None:
+            try:
+                self._req_proc.stdin.close()   # EOF ends the worker loop
+                self._req_proc.wait(timeout=3)
+            except (OSError, subprocess.TimeoutExpired):
+                self._req_proc.kill()
+            self._req_proc = None
         if self._proc is not None:
             self._proc.terminate()
             try:
@@ -192,6 +266,25 @@ class GzTransportBackend(GzBackendBase):
             self._proc = None
 
     # -- control ----------------------------------------------------------
+    def _request(self, service: str, req, ReqType, RespType):
+        blob = pickle.dumps((service, req.SerializeToString(),
+                             ReqType.DESCRIPTOR.full_name,
+                             RespType.DESCRIPTOR.full_name,
+                             self.request_timeout_ms))
+        proc = self._req_proc
+        proc.stdin.write(struct.pack('<I', len(blob)) + blob)
+        proc.stdin.flush()
+        head = proc.stdout.read(4)
+        if len(head) < 4:
+            raise RuntimeError(
+                f'gz request worker exited (code {proc.poll()}) during '
+                f'{service}')
+        ok, raw = pickle.loads(proc.stdout.read(struct.unpack('<I', head)[0]))
+        resp = RespType()
+        if ok:
+            resp.ParseFromString(raw)
+        return ok, resp
+
     def _control(self, pause: Optional[bool] = None, multi_step: int = 0,
                  reset_all: bool = False) -> None:
         req = self._WorldControl()
@@ -201,9 +294,9 @@ class GzTransportBackend(GzBackendBase):
             req.multi_step = multi_step
         if reset_all:
             req.reset.all = True
-        ok, resp = self._node.request(
+        ok, resp = self._request(
             f'/world/{self.world_name}/control', req, self._WorldControl,
-            self._Boolean, self.request_timeout_ms)
+            self._Boolean)
         if not (ok and resp.data):
             raise RuntimeError(
                 f'world control failed (pause={pause}, step={multi_step}, '
@@ -295,9 +388,9 @@ class GzTransportBackend(GzBackendBase):
         req.position.x, req.position.y, req.position.z = map(float, pos)
         req.orientation.w = math.cos(yaw / 2.0)
         req.orientation.z = math.sin(yaw / 2.0)
-        ok, resp = self._node.request(
+        ok, resp = self._request(
             f'/world/{self.world_name}/set_pose', req, self._Pose,
-            self._Boolean, self.request_timeout_ms)
+            self._Boolean)
         if not (ok and resp.data):
             raise RuntimeError(f'set_pose({model}) refused')
         # Queued by UserCommands: takes effect on the next PreUpdate.

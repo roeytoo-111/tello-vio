@@ -40,7 +40,19 @@ sudo apt-get install -y gz-harmonic ros-humble-ros-gzharmonic
 echo
 echo "=== verify ==="
 gz sim --versions
-python3 -c "from gz.transport13 import Node; from gz.msgs10.world_control_pb2 import WorldControl; print('gz python bindings OK')"
+# Import as the invoking user: under sudo, root does not see ~/.local, where
+# a pip protobuf >= 4 breaks the apt _pb2 files (gz_iface selects the
+# pure-Python protobuf implementation to cope).
+VERIFY_USER="${SUDO_USER:-$(id -un)}"
+sudo -u "$VERIFY_USER" -H python3 -c "
+import os
+from importlib import metadata
+major = int(metadata.version('protobuf').split('.')[0])
+if major >= 4:
+    os.environ.setdefault('PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION', 'python')
+from gz.transport13 import Node
+from gz.msgs10.world_control_pb2 import WorldControl
+print('gz python bindings OK (as $VERIFY_USER, protobuf', metadata.version('protobuf') + ')')"
 echo
 echo "Next (in this order -- sim_training_architecture.md 3.2):"
 echo "  1. python3 -m chase_sim_gz.sign_test      # yaw sign: gz issue #2657 is OPEN"

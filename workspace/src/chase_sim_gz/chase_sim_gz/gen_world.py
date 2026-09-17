@@ -41,8 +41,14 @@ MOTOR_CONSTANT = (0.080 * 9.81 / 4.0) / (HOVER_FRACTION * MAX_ROT_VEL) ** 2
 MOMENT_CONSTANT = 0.016    # X3's thrust->moment ratio (start value)
 TIME_CONSTANT_UP = 0.0125  # X3 (start values; calibrate to T_lag, 3.2)
 TIME_CONSTANT_DOWN = 0.025
-ROTOR_DRAG = 8.06428e-05
-ROLLING_MOMENT = 1e-06
+# Rotor drag force = coeff * rotor speed * airspeed. The X3's 8.06428e-5
+# copied unchanged gives this 80 g vehicle ~36x the X3's drag deceleration
+# (hover rotor speed 1250 vs 656 rad/s, mass 0.08 vs 1.5 kg): measured on
+# gz 8.15, yaw rate stalled at 0.118 of 0.5 rad/s and forward speed at
+# ~0.04 of 0.3 m/s. Scale to keep the X3's coeff*speed/mass per rotor.
+X3_DRAG_PER_MASS = 8.06428e-05 * 656.0 / 1.5
+ROTOR_DRAG = X3_DRAG_PER_MASS * 0.080 / (HOVER_FRACTION * MAX_ROT_VEL)
+ROLLING_MOMENT = 1e-06 * ROTOR_DRAG / 8.06428e-05
 ROTOR_VELOCITY_SLOWDOWN = 10
 # Controller gains: X3's scaled by mass ratio (0.080/1.5) for the linear
 # loop and by box-inertia ratio (~1/350) for the attitude loops.
