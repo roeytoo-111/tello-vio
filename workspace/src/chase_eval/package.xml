@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>chase_eval</name>
+  <version>0.1.0</version>
+  <description>
+    Evaluation for the chase policy: the frozen five-family suite with the
+    eval trio (return / time-in-view / loss rate), rliable-protocol IQM +
+    stratified bootstrap CIs, and the section 16.3 replay-validation gate
+    (real command log through the sim vs the recorded YOLO track).
+
+    Pure Python, no ROS imports (guide 15).
+  </description>
+  <maintainer email="roey.turgeman@aerosentry.tech">Roey Turgeman</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>chase_gym</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

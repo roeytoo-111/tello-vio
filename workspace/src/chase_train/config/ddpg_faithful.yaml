@@ -1,0 +1,36 @@
+# Arm F -- the faithful reproduction: the published code's configuration
+# VERBATIM (rl_block_diagram.md 3; guide 11.8 column [C]). It trains in the
+# original's point-mass world with raw-pixel observations, OU noise with the
+# keras-rl dt=1e-2 semantics added POST-x60-scale, and the 10-step cutoff
+# stored as terminal (keras-rl behaviour, [D-impl 7]). Do not "improve" any
+# value here: deviations make it a different arm.
+arm: ddpg_faithful
+seed: 123                  # the original's seed [C rl_drone.py:19-20]
+env: {}                    # FaithfulPointMassEnv takes no config
+nets:
+  hidden_actor: [16, 16, 16]
+  hidden_critic: [32, 32, 32]
+  faithful_init: true      # Glorot hidden, RandomUniform +/-0.05 head
+train:
+  total_steps: 100000      # nb_steps -- STEPS, not episodes [C]
+  gamma: 0.99
+  tau: 0.001
+  batch: 32
+  buffer: 100000
+  actor_lr: 1.0e-3
+  critic_lr: 1.0e-3
+  clipnorm: 1.0
+  start_steps: 0           # keras-rl has no uniform warm-start
+  update_after: 100        # nb_steps_warmup_{actor,critic}=100
+  policy_delay: 1
+  target_noise: 0.0
+  noise_clip: 0.0
+  action_scale: 60.0
+  truncation_as_terminal: true
+  noise: {type: ou, theta: 0.15, ou_sigma: 0.3, ou_dt: 1.0e-2, post_scale: true}
+  demo_prefill_episodes: 0
+eval:
+  every: 5000
+  episodes_per_scenario: 10
+curriculum:
+  enabled: false

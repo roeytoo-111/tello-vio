@@ -1,0 +1,35 @@
+# Arm T -- TD3, the primary (rl_training_guide.md 13.5, "Ours" column 11.8).
+arm: td3
+env:
+  task: follow
+  scenario: mix          # curriculum narrows this per stage
+  episode_steps: 300
+  latency: true
+  corruption: true
+  obs_mode: latency_aware
+  k: 4
+  reward_version: repaired
+nets:
+  hidden_actor: [256, 256]
+  hidden_critic: [256, 256]
+  final_init: 3.0e-3
+train:
+  total_steps: 200000
+  gamma: 0.99
+  tau: 0.005
+  batch: 64
+  buffer: 100000
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  start_steps: 1000
+  update_after: 1000
+  policy_delay: 2
+  target_noise: 0.2
+  noise_clip: 0.5
+  noise: {type: gaussian, sigma0: 0.3, sigma_min: 0.05}
+  demo_prefill_episodes: 20
+eval:
+  every: 5000
+  episodes_per_scenario: 10
+curriculum:
+  enabled: true

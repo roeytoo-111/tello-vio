@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>chase_gym</name>
+  <version>0.1.0</version>
+  <description>
+    Tier A of the three-tier simulator architecture
+    (docs/drone_chasing_rl/sim_training_architecture.md): the point-kinematics
+    image-plane chase environment where ALL gradient training runs, plus the
+    shared contract modules (observation assembly, reward, latency queue,
+    detector-corruption model, pinhole projection) that Tiers B/C and the
+    deployment nodes import unchanged.
+
+    Pure Python: no module here imports a ROS symbol (rl_training_guide.md
+    section 15). It is an ament package only so colcon installs it next to the
+    ROS packages that import it. Pip deps without rosdep keys: gymnasium
+    (verified 1.x), numpy.
+  </description>
+  <maintainer email="roey.turgeman@aerosentry.tech">Roey Turgeman</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

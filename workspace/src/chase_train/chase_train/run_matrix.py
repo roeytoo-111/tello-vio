@@ -1,0 +1,76 @@
+"""The arms x seeds matrix, scripted -- never manual (guide 24).
+
+    python3 -m chase_train.run_matrix --arms td3 ddpg_repaired ddpg_faithful \
+        --seeds 0 1 2 3 4 --jobs 2
+
+Each cell is a subprocess of chase_train.train with its own run directory;
+a matrix.json index is written at the end. --jobs parallelises across
+processes (each run is single-threaded-torch friendly at this model size).
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), 'config')
+
+
+def run_cell(arm: str, seed: int, extra_overrides, out_root: str) -> dict:
+    config = os.path.join(CONFIG_DIR, f'{arm}.yaml')
+    cmd = [sys.executable, '-m', 'chase_train.train', '--config', config,
+           '--seed', str(seed)]
+    overrides = list(extra_overrides) + [f'out_root={out_root}']
+    cmd += ['--override'] + overrides
+    t0 = time.time()
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    ok = proc.returncode == 0
+    run_dir = ''
+    for line in reversed(proc.stdout.splitlines()):
+        if line.startswith('[done] run dir: '):
+            run_dir = line.split(': ', 1)[1]
+            break
+    if not ok:
+        sys.stderr.write(f'--- {arm} s{seed} FAILED ---\n{proc.stderr[-2000:]}\n')
+    return {'arm': arm, 'seed': seed, 'ok': ok, 'run_dir': run_dir,
+            'wall_s': round(time.time() - t0, 1)}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--arms', nargs='+',
+                    default=['td3', 'ddpg_repaired', 'ddpg_faithful'])
+    ap.add_argument('--seeds', nargs='+', type=int, default=[0, 1, 2, 3, 4])
+    ap.add_argument('--jobs', type=int, default=1)
+    ap.add_argument('--out-root', default='runs')
+    ap.add_argument('--override', nargs='*', default=[])
+    args = ap.parse_args(argv)
+
+    cells = [(arm, seed) for arm in args.arms for seed in args.seeds]
+    print(f'matrix: {len(cells)} runs ({len(args.arms)} arms x '
+          f'{len(args.seeds)} seeds), jobs={args.jobs}')
+    results = []
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        futures = [pool.submit(run_cell, arm, seed, args.override,
+                               args.out_root) for arm, seed in cells]
+        for fut in futures:
+            res = fut.result()
+            results.append(res)
+            print(f"[matrix] {res['arm']} s{res['seed']}: "
+                  f"{'ok' if res['ok'] else 'FAILED'} ({res['wall_s']}s) "
+                  f"{res['run_dir']}")
+    index_path = os.path.join(args.out_root, 'matrix.json')
+    os.makedirs(args.out_root, exist_ok=True)
+    with open(index_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    failed = [r for r in results if not r['ok']]
+    print(f'matrix complete: {len(results) - len(failed)}/{len(results)} ok; '
+          f'index: {index_path}')
+    return 1 if failed else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

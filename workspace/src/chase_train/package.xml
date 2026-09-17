@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>chase_train</name>
+  <version>0.1.0</version>
+  <description>
+    The single TD3 trainer whose flags produce the three arms -- faithful
+    DDPG [C verbatim], repaired DDPG, TD3 (rl_training_guide.md 13.5) --
+    plus replay buffer with demonstration prefill, exploration noise with
+    the verified keras-rl OU semantics, the auditable checkpoint bundle
+    with ONNX export, the arms-x-seeds run matrix, and an SB3 cross-check.
+
+    Pure Python, no ROS imports (guide 15). Pip deps without rosdep keys:
+    torch (verified 2.13.0), gymnasium, stable-baselines3 (optional,
+    cross-check only), onnx + onnxruntime (optional, export only).
+  </description>
+  <maintainer email="roey.turgeman@aerosentry.tech">Roey Turgeman</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>chase_gym</exec_depend>
+  <exec_depend>chase_eval</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

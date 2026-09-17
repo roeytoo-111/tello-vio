@@ -1,0 +1,36 @@
+# Arm R -- repaired DDPG: TD3 minus the three tricks; R vs T isolates the
+# algorithm, F vs R isolates the reward/observation repairs (guide 13.5).
+arm: ddpg_repaired
+env:
+  task: follow
+  scenario: mix
+  episode_steps: 300
+  latency: true
+  corruption: true
+  obs_mode: latency_aware
+  k: 4
+  reward_version: repaired
+nets:
+  hidden_actor: [256, 256]
+  hidden_critic: [256, 256]
+  final_init: 3.0e-3
+train:
+  total_steps: 200000
+  gamma: 0.99
+  tau: 0.005
+  batch: 64
+  buffer: 100000
+  actor_lr: 3.0e-4
+  critic_lr: 3.0e-4
+  start_steps: 1000
+  update_after: 1000
+  policy_delay: 1          # no delay
+  target_noise: 0.0        # no target smoothing
+  noise_clip: 0.0
+  noise: {type: gaussian, sigma0: 0.3, sigma_min: 0.05}
+  demo_prefill_episodes: 20
+eval:
+  every: 5000
+  episodes_per_scenario: 10
+curriculum:
+  enabled: true
