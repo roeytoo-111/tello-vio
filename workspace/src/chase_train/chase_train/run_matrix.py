@@ -15,8 +15,26 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), 'config')
+def _config_dir() -> str:
+    """Source tree first; installed layout (share/chase_train/config via
+    colcon/ament prefixes) second -- site-packages/../config does not
+    exist when the package is installed."""
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), 'config')
+    if os.path.isdir(src):
+        return src
+    prefixes = [sys.prefix] + \
+        os.environ.get('AMENT_PREFIX_PATH', '').split(os.pathsep)
+    for prefix in filter(None, prefixes):
+        cand = os.path.join(prefix, 'share', 'chase_train', 'config')
+        if os.path.isdir(cand):
+            return cand
+    raise FileNotFoundError(
+        'chase_train config dir not found in the source tree or any '
+        'AMENT_PREFIX_PATH share directory')
+
+
+CONFIG_DIR = _config_dir()
 
 
 def run_cell(arm: str, seed: int, extra_overrides, out_root: str) -> dict:

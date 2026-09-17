@@ -14,7 +14,7 @@ setup(
         (os.path.join('share', package_name), ['package.xml']),
         (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     ],
-    install_requires=['setuptools', 'numpy', 'gymnasium'],
+    install_requires=['setuptools', 'numpy', 'gymnasium', 'torch'],
     zip_safe=True,
     maintainer='Roey Turgeman',
     maintainer_email='roey.turgeman@aerosentry.tech',

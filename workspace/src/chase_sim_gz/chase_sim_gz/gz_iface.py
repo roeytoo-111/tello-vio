@@ -189,8 +189,16 @@ class GzTransportBackend(GzBackendBase):
                 f'reset={reset_all})')
 
     def step(self, iterations: int) -> None:
-        """Lockstep: {pause: true, multi_step: N}, then wait on the
-        unthrottled world clock until sim time reaches the target."""
+        """Lockstep: {pause: true, multi_step: N}, wait on the unthrottled
+        world clock until sim time reaches the target, THEN wait until
+        every model's odometry has caught up to the step boundary.
+
+        The second wait is load-bearing: odometry arrives on its own topic
+        asynchronously to the clock, so without it get_odom() can return
+        None (before the first publish) or a pose up to one publish period
+        behind the boundary -- silently breaking reward/termination truth
+        and the one-seed-one-geometry contract on the real backend (the
+        kinematic fake, with instant odometry, cannot show this)."""
         target = self.sim_time() + iterations * self.physics_dt
         self._control(pause=True, multi_step=iterations)
         deadline = time.time() + self.step_timeout_s
@@ -202,17 +210,46 @@ class GzTransportBackend(GzBackendBase):
                         f'lockstep: sim time {self._sim_time:.4f} never '
                         f'reached {target:.4f}')
                 self._clock_cv.wait(min(remaining, 0.5))
+        self._wait_odoms(target, deadline)
+
+    # OdometryPublisher runs at 100 Hz SIM time (world SDF), so the newest
+    # sample can lag the step boundary by at most one period.
+    ODOM_PERIOD_S = 0.010
+
+    def _wait_odoms(self, target_t: float, deadline: float) -> None:
+        want = target_t - 1.5 * self.ODOM_PERIOD_S
+        while True:
+            stale = [m for m in self.models
+                     if self._odom.get(m) is None
+                     or self._odom[m].t_sim < want]
+            if not stale:
+                return
+            if time.time() > deadline:
+                raise TimeoutError(
+                    f'odometry for {stale} never reached sim time '
+                    f'{want:.3f} (have: '
+                    f'{ {m: getattr(self._odom.get(m), "t_sim", None) for m in stale} })')
+            time.sleep(0.001)
 
     def reset_world(self) -> None:
         self._control(pause=True, reset_all=True)
-        # The rewind applies on the next loop iteration while paused; give
-        # the server a moment, then confirm by stepping once and re-arming
-        # the (re-Configured) controllers with a zero command.
-        time.sleep(0.05)
-        self._sim_time = 0.0
+        # The rewind applies on the next loop iteration while paused; wait
+        # until the (unthrottled, publishes-while-paused) clock actually
+        # shows the rewound time, then re-arm the re-Configured controllers
+        # with a zero command and flush with one step.
+        deadline = time.time() + self.step_timeout_s
+        with self._clock_cv:
+            self._sim_time = float('inf')      # ignore pre-reset callbacks
+            while self._sim_time > 0.5:
+                if time.time() > deadline:
+                    raise TimeoutError('world reset never rewound sim time')
+                self._clock_cv.wait(0.5)
+        self._odom.clear()                     # pre-reset poses are stale
         for model in self.models:
             self.send_twist(model, (0.0, 0.0, 0.0), 0.0)
-        self.step(1)
+        # Flush at least one odometry period so _wait_odoms has a sample
+        # to see (the publisher emits every ODOM_PERIOD_S of sim time).
+        self.step(int(math.ceil(self.ODOM_PERIOD_S / self.physics_dt)) + 2)
 
     def set_pose(self, model: str, pos, yaw: float) -> None:
         req = self._Pose()
@@ -305,3 +342,28 @@ class FakeGzBackend(GzBackendBase):
         return OdomSample(t_sim=self._t, pos=st['pos'].copy(),
                           yaw=st['yaw'], lin_body=st['v_body'].copy(),
                           yaw_rate=st['yaw_rate'])
+
+
+# ---- shared script plumbing (sign_test, calibrate_lag, ab_replay_gate,
+# ---- finetune all take the same backend choice) --------------------------
+
+DEFAULT_WORLD = __import__('os').path.join(
+    __import__('os').path.dirname(__import__('os').path.dirname(
+        __import__('os').path.abspath(__file__))), 'worlds', 'chase.sdf')
+
+
+def add_backend_args(ap) -> None:
+    ap.add_argument('--fake', action='store_true',
+                    help='kinematic fake backend (no gz install needed)')
+    ap.add_argument('--world', default=None,
+                    help=f'world SDF for the real backend '
+                         f'(default: {DEFAULT_WORLD})')
+    ap.add_argument('--partition', default=None,
+                    help='GZ_PARTITION for concurrent instances')
+
+
+def make_backend(args, **fake_kwargs) -> GzBackendBase:
+    if args.fake:
+        return FakeGzBackend(**fake_kwargs)
+    return GzTransportBackend(args.world or DEFAULT_WORLD,
+                              partition=args.partition)

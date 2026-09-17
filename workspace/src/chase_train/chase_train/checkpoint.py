@@ -47,7 +47,7 @@ def library_versions() -> dict:
 
 def save_bundle(path: str, *, trainer, noise, cfg, obs_spec, action_map: dict,
                 env_config: dict, env_step: int, eval_snapshot: dict,
-                curriculum_stage: int = 0) -> str:
+                curriculum_stage: int = 0, run_rng=None) -> str:
     bundle = {
         'format_version': 1,
         'arm': cfg.arm,
@@ -71,6 +71,10 @@ def save_bundle(path: str, *, trainer, noise, cfg, obs_spec, action_map: dict,
             'python': random.getstate(),
             'numpy_legacy': np.random.get_state(),
             'torch': torch.get_rng_state(),
+            # The run's own Generator (exploration, batch indices): the
+            # state a resume must restore to truly continue the stream.
+            'numpy_generator': (run_rng.bit_generator.state
+                                if run_rng is not None else None),
         },
         'saved_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
     }

@@ -8,6 +8,8 @@ consumers -- chase_state onward -- receive exactly the staleness the real
 link imposes, with header stamps preserved (t_capture stays the capture
 time; arrival is simply later), which is how the real transport behaves.
 """
+from collections import deque
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -30,7 +32,7 @@ class LatencyShim(Node):
         self.base = float(self.rng.uniform(lo, hi))
         self.jitter = float(self.get_parameter('jitter_std_s').value)
 
-        self._pending = []          # (release_sim_time, msg), time-ordered
+        self._pending = deque()     # (release_sim_time, msg), time-ordered
         self.sub = self.create_subscription(
             DroneDetection, '/chase/detection', self._on_msg, 50)
         self.pub = self.create_publisher(
@@ -51,7 +53,7 @@ class LatencyShim(Node):
     def _tick(self) -> None:
         now = self._now_s()
         while self._pending and self._pending[0][0] <= now:
-            _, msg = self._pending.pop(0)
+            _, msg = self._pending.popleft()
             self.pub.publish(msg)
 
 

@@ -38,21 +38,15 @@ from chase_gym.corruption import Measurement
 from chase_gym.env import EnvConfig, forward_command
 from chase_gym.observation import ObservationAssembler, ObservationSpec
 from chase_gym.baselines import PController, PNController
+from chase_eval.evaluate import ActorPolicy
 
 DT = C.DT
 
 
-def load_policy(checkpoint: str, spec: ObservationSpec):
-    import torch
+def load_policy(checkpoint: str, spec: ObservationSpec) -> ActorPolicy:
     from chase_train.checkpoint import actor_from_bundle, load_bundle
     bundle = load_bundle(checkpoint, expect_obs_spec=spec)
-    actor = actor_from_bundle(bundle)
-
-    def policy(obs: np.ndarray) -> np.ndarray:
-        with torch.no_grad():
-            t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-            return actor(t).squeeze(0).numpy()
-    return policy
+    return ActorPolicy(actor_from_bundle(bundle))
 
 
 def detect(yolo, frame: np.ndarray):
@@ -75,46 +69,40 @@ def detect(yolo, frame: np.ndarray):
 
 
 def run_episode(eng, yolo, policy, cfg: EnvConfig, spec: ObservationSpec,
-                seed: int, max_steps: int, target_waypoints):
+                seed: int, max_steps: int):
     rng = np.random.default_rng(seed)
     asm = ObservationAssembler(spec)
+    if hasattr(policy, 'reset'):
+        policy.reset()             # baselines carry filter/LOS state
     # Reset geometry: follower at origin looking north, target ahead.
     eng.set_vehicle_pose((0.0, 0.0, -1.0), 0.0)      # NED: z=-1 is 1 m up
     r0 = rng.uniform(*cfg.resolved_reset_range())
     eng.set_object_pose('TargetTello', (r0, 0.0, -1.0), 0.0)
     time.sleep(0.5)
 
-    stats = {'steps': 0, 'detected': 0, 'in_view': 0, 'captured': False}
-    last_meas = None
-    yaw = 0.0
+    stats = {'steps': 0, 'detected': 0, 'captured': False}
     for k in range(max_steps):
         frame = eng.get_rgb()
         meas, inf_ms = detect(yolo, frame)
+        # Detection rate is the reported metric here; exact in-view truth
+        # needs engine ground truth and is a Tier-B/A quantity.
         stats['detected'] += int(meas is not None)
-        stats['in_view'] += int(meas is not None)    # detector IS the truth
-                                                     # proxy here; exact truth
-                                                     # needs engine ground
-                                                     # truth -- recorded as a
-                                                     # lower bound
-        a = policy(asm.assemble(meas, DT)) if not hasattr(policy, 'get_action') \
-            else policy.get_action(asm.assemble(meas, DT))
-        a = np.clip(np.asarray(a, dtype=np.float32), -1.0, 1.0)
+        a = np.clip(np.asarray(policy.get_action(asm.assemble(meas, DT)),
+                               dtype=np.float32), -1.0, 1.0)
         asm.record_action(a)
         v_fwd = forward_command(cfg, meas)
-        # Body-frame sticks -> NED world velocities through current yaw.
+        # BODY-frame command (the Tello stick semantics): the engine's own
+        # heading applies -- no client-side yaw dead-reckoning, which
+        # drifts against controller lag and YOLO wall-time.
         v_up = float(a[0]) * cfg.v_max
         yaw_rate = float(a[1]) * cfg.omega_max
-        vn = v_fwd * math.cos(yaw)
-        ve = v_fwd * math.sin(yaw)
-        eng.move_by_velocity(vn, ve, -v_up, yaw_rate, DT)
-        yaw += yaw_rate * DT
+        eng.move_by_velocity_body(v_fwd, 0.0, -v_up, yaw_rate, DT)
         stats['steps'] += 1
         if meas is not None and cfg.task == 'intercept':
             d_est = C.FX * cfg.ref_width_m / max(meas.w_px, 1.0)
             if d_est <= cfg.r_cap_m:
                 stats['captured'] = True
                 break
-        last_meas = meas
     eng.hover()
     return stats
 
@@ -153,7 +141,7 @@ def main(argv=None):
     try:
         for e in range(args.episodes):
             st = run_episode(eng, yolo, policy, cfg, spec, seed=20_000 + e,
-                             max_steps=args.steps, target_waypoints=None)
+                             max_steps=args.steps)
             st['detection_rate'] = st['detected'] / max(st['steps'], 1)
             episodes.append(st)
             print(f"  ep {e}: steps {st['steps']}  detect "

@@ -22,6 +22,27 @@ from chase_gym import ChaseEnv, EnvConfig
 from chase_gym.target_motion import FAMILIES
 
 
+class ActorPolicy:
+    """The one adapter that makes a trained actor look like a controller:
+    get_action(obs) + reset(). Everything the suite runs -- checkpoints,
+    P-controller, PN -- shares this surface, so no call site branches on
+    policy shape (and none can forget the per-episode reset)."""
+
+    def __init__(self, actor):
+        import torch
+        self._torch = torch
+        self._actor = actor.eval()
+
+    def reset(self) -> None:
+        pass                       # a deterministic actor holds no state
+
+    def get_action(self, obs: np.ndarray) -> np.ndarray:
+        with self._torch.no_grad():
+            t = self._torch.as_tensor(obs, dtype=self._torch.float32
+                                      ).unsqueeze(0)
+            return self._actor(t).squeeze(0).cpu().numpy()
+
+
 @dataclass
 class FamilyResult:
     family: str
@@ -49,10 +70,13 @@ class FamilyResult:
         }
 
 
-def run_episode(env, policy: Callable[[np.ndarray], np.ndarray],
-                seed: int, action_bins: Optional[np.ndarray] = None,
+def run_episode(env, policy, seed: int,
+                action_bins: Optional[np.ndarray] = None,
                 action_hist: Optional[np.ndarray] = None) -> dict:
     obs, info = env.reset(seed=seed)
+    # One dispatch, hoisted; a bare callable (e.g. a lambda over
+    # trainer.act) is wrapped on the fly.
+    get = policy.get_action if hasattr(policy, 'get_action') else policy
     if hasattr(policy, 'reset'):
         policy.reset()
     total_r = 0.0
@@ -62,13 +86,12 @@ def run_episode(env, policy: Callable[[np.ndarray], np.ndarray],
     lost = False
     captured = False
     while True:
-        a = np.asarray(policy(obs) if not hasattr(policy, 'get_action')
-                       else policy.get_action(obs), dtype=np.float32)
+        a = np.asarray(get(obs), dtype=np.float32)
         if action_hist is not None:
-            for j in range(min(len(a), action_hist.shape[0])):
-                b = int(np.clip(np.digitize(a[j], action_bins) - 1, 0,
-                                action_hist.shape[1] - 1))
-                action_hist[j, b] += 1
+            n_dims = min(len(a), action_hist.shape[0])
+            b = np.clip(np.digitize(a[:n_dims], action_bins) - 1, 0,
+                        action_hist.shape[1] - 1)
+            action_hist[np.arange(n_dims), b] += 1
         obs, r, terminated, truncated, info = env.step(a)
         total_r += r
         steps += 1

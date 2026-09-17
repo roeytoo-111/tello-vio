@@ -22,10 +22,11 @@ import gymnasium as gym
 import numpy as np
 
 from . import constants as C
-from .corruption import CorruptionConfig, CorruptionModel, Measurement
+from .corruption import CorruptionConfig, Measurement
 from .kinematics import FollowerKinematics, project, world_to_camera
-from .latency import DelayQueue, LatencyModel
 from .observation import ObservationAssembler, ObservationSpec
+from .pipeline import (MeasurementPipe, body_offset_from_frame_draw,
+                       draw_reset_placement)
 from .reward import RewardComputer, RewardConfig
 from . import target_motion
 
@@ -88,6 +89,25 @@ class EnvConfig:
         return (2.0, 6.0) if self.task == 'intercept' else (1.5, 2.5)
 
 
+def reward_config_from(cfg: EnvConfig, trainer_gamma: Optional[float] = None
+                       ) -> RewardConfig:
+    """The ONE mapping EnvConfig -> RewardConfig, used by both envs and by
+    the demo-reward recompute (so demos and on-policy transitions can never
+    carry two different reward functions). When the trainer's gamma is
+    known, it must equal the env's -- the shaping's policy invariance
+    (guide 22) depends on it."""
+    if trainer_gamma is not None and abs(trainer_gamma - cfg.gamma) > 1e-12:
+        raise ValueError(
+            f'trainer gamma {trainer_gamma} != env gamma {cfg.gamma}; '
+            f'potential-based shaping is only policy-invariant at the '
+            f'discount actually trained with')
+    return RewardConfig(
+        version=cfg.reward_version, w_smooth=cfg.w_smooth,
+        w_loss=cfg.w_loss, intercept=(cfg.task == 'intercept'),
+        gamma=cfg.gamma, shaping_lambda=cfg.shaping_lambda,
+        capture_bonus=cfg.capture_bonus)
+
+
 def forward_command(cfg: EnvConfig, meas) -> float:
     """The hand-coded forward-axis law, shared by every tier (Tier B's
     GzChaseEnv imports THIS function): metric standoff for FOLLOW, bounded
@@ -120,18 +140,8 @@ class ChaseEnv(gym.Env):
         self.obs_spec = ObservationSpec(mode=self.cfg.obs_mode, k=self.cfg.k,
                                         control_dt_s=self.cfg.dt)
         self._assembler = ObservationAssembler(self.obs_spec)
-        self._reward = RewardComputer(RewardConfig(
-            version=self.cfg.reward_version, w_smooth=self.cfg.w_smooth,
-            w_loss=self.cfg.w_loss, intercept=(self.cfg.task == 'intercept'),
-            gamma=self.cfg.gamma, shaping_lambda=self.cfg.shaping_lambda,
-            capture_bonus=self.cfg.capture_bonus))
-        self._latency = LatencyModel(
-            enabled=self.cfg.latency, base_range_s=self.cfg.latency_range_s,
-            jitter_std_s=self.cfg.latency_jitter_std_s)
-        corr_cfg = self.cfg.corruption_cfg
-        corr_cfg.enabled = corr_cfg.enabled and self.cfg.corruption
-        self._corruption = CorruptionModel(corr_cfg)
-        self._queue = DelayQueue()
+        self._reward = RewardComputer(reward_config_from(self.cfg))
+        self._pipe = MeasurementPipe.from_env_cfg(self.cfg)
         self._follower = FollowerKinematics(self.cfg.t_lag)
 
         if self.obs_spec.mode == 'raw_pixels':
@@ -170,59 +180,43 @@ class ChaseEnv(gym.Env):
         rng = self.np_random
         cfg = self.cfg
 
-        # DRAW ORDER CONTRACT: placement first, then family, then the
-        # tier-specific draws. GzChaseEnv consumes its stream in the SAME
-        # order, so one seed means one initial geometry in every tier --
-        # the A<->B replay gate depends on this (chase_sim_gz).
-        # Place the target: range from the operating band, box centre
-        # uniform inside the margin rectangle, back-projected (guide 16.3).
-        r_lo, r_hi = cfg.resolved_reset_range()
-        z_cam = rng.uniform(r_lo, r_hi)
-        m = cfg.reset_frame_margin
-        u0 = rng.uniform(C.FRAME_W * m, C.FRAME_W * (1.0 - m))
-        v0 = rng.uniform(C.FRAME_H * m, C.FRAME_H * (1.0 - m))
-        family = str(rng.choice(list(self._stage_families)))
-
-        # Episode draws: lag jitter, latency base (guide 16.1 lines 2, 5).
-        jitter = rng.uniform(-cfg.t_lag_jitter, cfg.t_lag_jitter)
-        self._t_lag_ep = cfg.t_lag * (1.0 + jitter)
-        self._follower = FollowerKinematics(self._t_lag_ep)
-        self._follower.reset(pos=(0.0, 0.0, 1.0), yaw=0.0)
-        self._latency.reset(rng)
-        self._corruption.reset()
+        # Steps 1-4 of the DRAW ORDER CONTRACT (pipeline.py): placement,
+        # family, latency base, generator params -- shared with Tier B.
+        z_cam, u0, v0, family = draw_reset_placement(
+            rng, cfg.resolved_reset_range(), cfg.reset_frame_margin,
+            self._stage_families)
+        self._pipe.reset(rng)
         self._assembler.reset()
-        self._queue.clear()
 
-        x_cam = (u0 - C.CX) * z_cam / C.FX
-        y_cam = (v0 - C.CY) * z_cam / C.FY
-        # camera -> body -> world (yaw = 0 at reset; see kinematics.py).
-        body = np.array([z_cam, -x_cam, -y_cam])
-        target_pos = self._follower.state.pos + body
+        follower_pos = np.array([0.0, 0.0, 1.0])
+        target_pos = follower_pos + body_offset_from_frame_draw(z_cam, u0, v0)
         target_pos[2] = max(target_pos[2], 0.2)   # stay above the floor
-
         self._target = target_motion.make(family, rng, target_pos,
                                           self._stage_cap)
         self._family = family
+
+        # Step 5: tier-specific draws LAST -- Tier A's lag jitter
+        # (guide 16.1 line 2).
+        jitter = rng.uniform(-cfg.t_lag_jitter, cfg.t_lag_jitter)
+        self._t_lag_ep = cfg.t_lag * (1.0 + jitter)
+        self._follower = FollowerKinematics(self._t_lag_ep)
+        self._follower.reset(pos=follower_pos, yaw=0.0)
 
         self._t = 0.0
         self._steps = 0
         self._a_prev = np.zeros(2, dtype=np.float32)
         self._last_meas: Optional[Measurement] = None
 
-        # Pre-roll the delay pipe: the pair hovered before ENGAGE, so the
-        # queue opens with a short static history instead of an empty pipe.
-        n_pre = int(math.ceil(
-            (cfg.latency_range_s[1] + 4 * cfg.latency_jitter_std_s) / cfg.dt)) + 1
         cam = world_to_camera(self._target.pos, self._follower.state)
         u, v, w_px, in_frame = project(cam, cfg.ref_width_m)
-        for i in range(n_pre, 0, -1):
-            if in_frame:
-                self._queue.push(-i * cfg.dt, Measurement(u, v, w_px))
+        self._pipe.preroll(0.0, cfg.dt,
+                           Measurement(u, v, w_px) if in_frame else None,
+                           cfg.latency_range_s[1], cfg.latency_jitter_std_s)
         self._prev_range = float(np.linalg.norm(
             self._target.pos - self._follower.state.pos))
 
         # First observation: sample the pre-rolled pipe at t = 0.
-        meas = self._sample_pipe(rng)
+        meas = self._pipe.sample(self._t, rng)
         self._last_meas = meas
         obs = self._assembler.assemble(meas, cfg.dt)
         return obs, self._info(u, v, w_px, in_frame, meas is not None,
@@ -261,10 +255,10 @@ class ChaseEnv(gym.Env):
         # 5. Truth enters the delay line only while the oracle would see it
         #    (FOV test -- sim_training_architecture.md 3.3 step 4).
         if in_frame:
-            self._queue.push(self._t, Measurement(u, v, w_px))
+            self._pipe.push(self._t, Measurement(u, v, w_px))
 
         # 6-7. Sample Delta old, corrupt (lines 5-6).
-        meas = self._sample_pipe(rng)
+        meas = self._pipe.sample(self._t, rng)
         self._last_meas = meas
 
         # 8. Observation via THE shared module (line 7); history carries the
@@ -292,11 +286,6 @@ class ChaseEnv(gym.Env):
         return obs, float(r), terminated, truncated, info
 
     # ---- internals -------------------------------------------------------
-    def _sample_pipe(self, rng) -> Optional[Measurement]:
-        delayed = self._queue.sample(self._t - self._latency.delay(rng))
-        payload = delayed[1] if delayed is not None else None
-        return self._corruption.apply(payload, rng)
-
     def _forward_command(self, meas: Optional[Measurement]) -> float:
         return forward_command(self.cfg, meas)
 
@@ -308,7 +297,7 @@ class ChaseEnv(gym.Env):
             'range_m': float(range_m),
             'u': float(u), 'v': float(v), 'w_px': float(w_px),
             'family': getattr(self, '_family', ''),
-            'latency_base_s': self._latency.base_s,
+            'latency_base_s': self._pipe.latency_base_s,
             't_lag_s': getattr(self, '_t_lag_ep', self.cfg.t_lag),
         }
 

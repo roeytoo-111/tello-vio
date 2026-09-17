@@ -28,12 +28,19 @@ import numpy as np
 
 from . import constants as C
 
+# The /100 scaling of the repaired reward [D, guide 16.2/22]: a positive
+# linear transform, provably policy-invariant. It NUMERICALLY equals the
+# threshold today but is a separate design constant -- if the threshold
+# ever moves (e.g. the paper's 110 as an ablation), the scale stays put so
+# the tested anchors keep their meaning.
+REWARD_SCALE = 100.0
+
 
 def track_repaired(dist_px: float) -> float:
     """Continuous, scaled tracking core. In (0, 1] inside the disc."""
     if dist_px <= C.REWARD_THRESHOLD_PX:
-        return (C.REWARD_THRESHOLD_PX - dist_px) / 100.0
-    return -0.25 * (dist_px - C.REWARD_THRESHOLD_PX) / 100.0
+        return (C.REWARD_THRESHOLD_PX - dist_px) / REWARD_SCALE
+    return -0.25 * (dist_px - C.REWARD_THRESHOLD_PX) / REWARD_SCALE
 
 
 def track_faithful(dist_px: float) -> float:

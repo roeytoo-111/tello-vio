@@ -72,7 +72,11 @@ class TD3:
                             device=self.device).unsqueeze(0)
         return self.actor(t).squeeze(0).cpu().numpy()
 
-    def update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def update(self, batch: Dict[str, torch.Tensor],
+               compute_metrics: bool = True) -> Dict[str, float]:
+        """One gradient step. `compute_metrics=False` skips the diagnostic
+        reductions and their device syncs -- the dashboard reads them once
+        per eval, not once per step."""
         cfg = self.cfg
         obs, act = batch['obs'], batch['act']
         rew, obs2, done = batch['rew'], batch['obs2'], batch['done']
@@ -99,31 +103,38 @@ class TD3:
         self.critic_opt.step()
 
         self.grad_steps += 1
-        metrics = {
-            'critic_loss': float(critic_loss.item()),
-            'q1_mean': float(qs[0].mean().item()),
-            'q_max': float(qs[0].max().item()),
-            'td_abs_mean': float((y - qs[0]).abs().mean().item()),
-        }
-        if len(qs) == 2:
-            metrics['q_gap'] = float((qs[0] - qs[1]).abs().mean().item())
+        metrics: Dict[str, float] = {}
+        if compute_metrics:
+            metrics = {
+                'critic_loss': float(critic_loss.item()),
+                'q1_mean': float(qs[0].mean().item()),
+                'q_max': float(qs[0].max().item()),
+                'td_abs_mean': float((y - qs[0]).abs().mean().item()),
+            }
+            if len(qs) == 2:
+                metrics['q_gap'] = float((qs[0] - qs[1]).abs().mean().item())
 
         # Trick 3: delayed policy + target updates, counted in grad steps.
         if self.grad_steps % cfg.policy_delay == 0:
+            # try/finally: an exception mid-update (OOM, interrupt, NaN
+            # hook) must never leave the critic permanently frozen.
             for p in self.critic.parameters():
                 p.requires_grad_(False)
-            actor_loss = -self.critic.q1(obs, self.actor(obs)).mean()
-            self.actor_opt.zero_grad(set_to_none=True)
-            actor_loss.backward()
-            if cfg.clipnorm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(),
-                                               cfg.clipnorm)
-            self.actor_opt.step()
-            for p in self.critic.parameters():
-                p.requires_grad_(True)
+            try:
+                actor_loss = -self.critic.q1(obs, self.actor(obs)).mean()
+                self.actor_opt.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                if cfg.clipnorm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(),
+                                                   cfg.clipnorm)
+                self.actor_opt.step()
+            finally:
+                for p in self.critic.parameters():
+                    p.requires_grad_(True)
             self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic, self.critic_target)
-            metrics['actor_loss'] = float(actor_loss.item())
+            if compute_metrics:
+                metrics['actor_loss'] = float(actor_loss.item())
         return metrics
 
     def _soft_update(self, src: torch.nn.Module, dst: torch.nn.Module) -> None:

@@ -23,7 +23,6 @@ by FaithfulPointMassEnv itself.
 """
 import hashlib
 import json
-from collections import deque
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -77,9 +76,10 @@ class ObservationAssembler:
         self._ex_prev = 0.0
         self._ey_prev = 0.0
         self._since_detection_s = s.loss_timeout_s   # starts fully stale
-        self._history = deque(
-            [np.zeros(s.action_dim, dtype=np.float32) for _ in range(s.k)],
-            maxlen=s.k)
+        # Preallocated ring, newest at _head: assemble() runs once per
+        # control step on the hot path -- no per-step allocation.
+        self._history = np.zeros((s.k, s.action_dim), dtype=np.float32)
+        self._head = 0
 
     def record_action(self, action_sent: np.ndarray) -> None:
         """Store what was actually SENT (post-clamp), newest first."""
@@ -88,7 +88,8 @@ class ObservationAssembler:
         if a.shape[0] != self.spec.action_dim:
             raise ValueError(
                 f'action dim {a.shape[0]} != spec {self.spec.action_dim}')
-        self._history.appendleft(a)
+        self._head = (self._head - 1) % self.spec.k
+        self._history[self._head] = a
 
     def assemble(self, meas: Optional[Measurement], dt_s: float) -> np.ndarray:
         """One observation from this step's (possibly missing) measurement.
@@ -127,8 +128,10 @@ class ObservationAssembler:
         obs[3] = self._ey_prev
         obs[4] = visible
         obs[5] = staleness
-        flat = np.concatenate(list(self._history))
-        obs[6:] = flat
+        hist = obs[6:].reshape(s.k, s.action_dim)
+        n_tail = s.k - self._head
+        hist[:n_tail] = self._history[self._head:]
+        hist[n_tail:] = self._history[:self._head]
         self._ex_prev = ex
         self._ey_prev = ey
 

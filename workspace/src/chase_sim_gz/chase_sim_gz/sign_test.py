@@ -31,7 +31,7 @@ import numpy as np
 
 from chase_gym.kinematics import FollowerState, project, world_to_camera
 
-from .gz_iface import FakeGzBackend, GzTransportBackend
+from .gz_iface import add_backend_args, make_backend
 
 
 def project_target(backend) -> tuple:
@@ -62,19 +62,11 @@ def settle(backend):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--fake', action='store_true',
-                    help='run against the kinematic fake (CI mode)')
-    ap.add_argument('--world', default=None)
+    add_backend_args(ap)
     ap.add_argument('--out', default='sign_test_result.json')
     args = ap.parse_args(argv)
 
-    if args.fake:
-        backend = FakeGzBackend()
-    else:
-        world = args.world or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'worlds', 'chase.sdf')
-        backend = GzTransportBackend(world)
+    backend = make_backend(args)
     backend.start()
 
     checks = []

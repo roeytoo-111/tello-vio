@@ -21,7 +21,7 @@ import numpy as np
 
 from chase_gym import ChaseEnv, EnvConfig, PController
 
-from .gz_iface import FakeGzBackend, GzTransportBackend
+from .gz_iface import add_backend_args, make_backend
 from .gz_chase_env import GzChaseEnv
 
 
@@ -55,9 +55,7 @@ def replay_tier_b(env: GzChaseEnv, seed: int, actions):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--fake', action='store_true',
-                    help='Tier B = kinematic fake (CI); default real gz')
-    ap.add_argument('--world', default=None)
+    add_backend_args(ap)
     ap.add_argument('--episodes', type=int, default=3)
     ap.add_argument('--steps', type=int, default=100)
     ap.add_argument('--scenario', default='static',
@@ -72,14 +70,8 @@ def main(argv=None):
     # its response, making the CI gate isolate integration/placement error.
     cfg = EnvConfig(scenario=args.scenario, latency=False, corruption=False,
                     episode_steps=args.steps, t_lag_jitter=0.0)
-    if args.fake:
-        backend = FakeGzBackend(response_tau=cfg.t_lag)
-    else:
-        import os
-        world = args.world or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'worlds', 'chase.sdf')
-        backend = GzTransportBackend(world)
+    backend = make_backend(args, response_tau=cfg.t_lag) if args.fake \
+        else make_backend(args)
     env_b = GzChaseEnv(backend, cfg)
 
     per_episode = []

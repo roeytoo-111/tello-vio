@@ -63,6 +63,13 @@ class EngineBase:
     def get_bboxes(self) -> List[BBox]: ...
     def move_by_velocity(self, v_north: float, v_east: float, v_down: float,
                          yaw_rate_rad_s: float, duration_s: float) -> None: ...
+    def move_by_velocity_body(self, v_fwd: float, v_right: float,
+                              v_down: float, yaw_rate_rad_s: float,
+                              duration_s: float) -> None:
+        """Body-frame velocity + yaw rate -- the Tello stick semantics.
+        Preferred for closed-loop control: no client-side yaw
+        dead-reckoning (which drifts against the engine's true heading)."""
+        ...
     def hover(self) -> None: ...
 
 
@@ -157,6 +164,16 @@ class ProjectAirSimEngine(EngineBase):
             yaw_is_rate=True, yaw=float(yaw_rate_rad_s))
         asyncio.get_event_loop().run_until_complete(task)
 
+    def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
+                              duration_s) -> None:
+        import asyncio
+        from projectairsim.drone import YawControlMode
+        task = self._drone.move_by_velocity_body_frame_async(
+            float(v_fwd), float(v_right), float(v_down), float(duration_s),
+            yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+            yaw_is_rate=True, yaw=float(yaw_rate_rad_s))
+        asyncio.get_event_loop().run_until_complete(task)
+
     def hover(self) -> None:
         self.move_by_velocity(0.0, 0.0, 0.0, 0.0, 0.1)
 
@@ -235,6 +252,16 @@ class ClassicEngine(EngineBase):
         # Classic yaw_mode is DEGREES/s [V apis.md] -- convert from SI.
         self._client.moveByVelocityAsync(
             float(v_north), float(v_east), float(v_down), float(duration_s),
+            drivetrain=a.DrivetrainType.MaxDegreeOfFreedom,
+            yaw_mode=a.YawMode(is_rate=True,
+                               yaw_or_rate=math.degrees(yaw_rate_rad_s)),
+            vehicle_name=self.vehicle).join()
+
+    def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
+                              duration_s) -> None:
+        a = self._airsim
+        self._client.moveByVelocityBodyFrameAsync(
+            float(v_fwd), float(v_right), float(v_down), float(duration_s),
             drivetrain=a.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode=a.YawMode(is_rate=True,
                                yaw_or_rate=math.degrees(yaw_rate_rad_s)),

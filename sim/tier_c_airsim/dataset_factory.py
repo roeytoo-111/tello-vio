@@ -31,7 +31,12 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import BBox, bbox_from_mask, make_engine  # noqa: E402
 
-FRAME_W, FRAME_H = 960, 720          # the real camera's geometry [V]
+# The real camera's geometry comes from the shared constants (the repo's
+# chase_gym must be on PYTHONPATH, as for vision_in_loop_eval.py) -- never
+# restated (chase_gym/constants.py contract).
+from chase_gym import constants as _C  # noqa: E402
+
+FRAME_W, FRAME_H = _C.FRAME_W, _C.FRAME_H
 
 # The follower hovers at the origin looking north (NED +x); the target is
 # placed on a polar grid in front of it.
@@ -116,8 +121,8 @@ def dry_run() -> int:
     b = BBox('t', *box)
     line = yolo_line(b, FRAME_W, FRAME_H)
     parts = [float(x) for x in line.split()[1:]]
-    assert abs(parts[0] - (529.5 / 960)) < 1e-6
-    assert abs(parts[2] - (59.0 / 960)) < 1e-6
+    assert abs(parts[0] - (529.5 / FRAME_W)) < 1e-6
+    assert abs(parts[2] - (59.0 / FRAME_W)) < 1e-6
     assert bbox_from_mask(np.zeros((4, 4), dtype=bool)) is None
     grid = sum(1 for _ in pose_grid()) * len(LIGHTING)
     print(f'[dry-run] label arithmetic OK; grid = {grid} captures '

@@ -21,6 +21,7 @@ import torch
 import gymnasium
 
 from chase_gym import ChaseEnv, EnvConfig, FaithfulPointMassEnv, PController
+from chase_gym.env import reward_config_from
 from chase_eval.evaluate import default_env_factory, run_suite
 
 from .buffer import ReplayBuffer, load_demos
@@ -93,11 +94,13 @@ def action_map(cfg: RunConfig) -> dict:
                      'chase_gym/test/test_kinematics.py'}
 
 
-def prefill_demos(cfg: RunConfig, buf: ReplayBuffer, obs_spec) -> int:
-    """P-controller episodes straight into the buffer (guide 17). Rewards
-    come from the live reward function inside the env, which is exactly the
-    recompute-on-load guarantee for in-process demos; .npz demo dirs (real
-    flights) additionally go through load_demos()."""
+def prefill_demos(cfg: RunConfig, buf: ReplayBuffer) -> int:
+    """P-controller episodes straight into the buffer (guide 17). In-process
+    demos get their reward from the live env; .npz demo dirs (real flights)
+    are recomputed through reward_config_from -- the SAME EnvConfig->
+    RewardConfig mapping the env itself uses, so one buffer can never hold
+    two reward functions. reward_config_from also enforces
+    train.gamma == env gamma (shaping invariance)."""
     n_eps = cfg.train.demo_prefill_episodes
     added = 0
     if n_eps > 0:
@@ -115,22 +118,22 @@ def prefill_demos(cfg: RunConfig, buf: ReplayBuffer, obs_spec) -> int:
                 if term or trunc:
                     break
     if cfg.train.demo_dir:
-        from chase_gym.reward import RewardComputer, RewardConfig
-        rc = RewardComputer(RewardConfig(
-            version=cfg.env.get('reward_version', 'repaired'),
-            intercept=(cfg.env.get('task') == 'intercept'),
-            gamma=cfg.train.gamma))
+        from chase_gym.reward import RewardComputer
+        rc = RewardComputer(reward_config_from(
+            EnvConfig(**cfg.env), trainer_gamma=cfg.train.gamma))
         added += load_demos(cfg.train.demo_dir, buf, rc.compute)
     return added
 
 
 class Curriculum:
-    def __init__(self, cfg: RunConfig, env):
+    def __init__(self, cfg: RunConfig, env, stage: int = 0):
         self.cfg = cfg
         self.env = env
-        self.stage = 0
         self.enabled = (cfg.curriculum.enabled
                         and cfg.arm != 'ddpg_faithful')
+        self.stage = int(np.clip(stage, 0,
+                                 len(cfg.curriculum.stages) - 1)) \
+            if self.enabled else 0
         if self.enabled:
             self._apply()
 
@@ -210,28 +213,65 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                    'device': device}, f, indent=2)
     metrics_path = os.path.join(run_dir, 'metrics.jsonl')
 
-    obs_spec = env.obs_spec if not faithful else _FaithfulSpec()
-    env_config = env.env_config_dict() if not faithful else {
-        'env': 'FaithfulPointMassEnv', 'episode_cap': FAITHFUL_EPISODE_CAP,
-        'reward_version': 'faithful'}
+    # Every env (faithful included) exposes the same contract surface;
+    # gymnasium wrappers (the faithful arm's TimeLimit) do not forward
+    # attributes, so read it off the unwrapped env.
+    base_env = env.unwrapped
+    obs_spec = base_env.obs_spec
+    env_config = base_env.env_config_dict()
+    if not faithful:
+        # Shaping invariance: the trainer's discount must be the one the
+        # env's potential terms use (reward_config_from raises otherwise).
+        reward_config_from(env.cfg, trainer_gamma=cfg.train.gamma)
 
     start_step = 0
+    resumed_stage = 0
     if resume:
-        bundle = load_bundle(resume)
+        # The refusal is the contract (guide 19) -- also on resume.
+        bundle = load_bundle(resume, expect_obs_spec=obs_spec)
+        if bundle['env_step'] >= cfg.train.total_steps:
+            raise SystemExit(
+                f"refusing resume: bundle env_step {bundle['env_step']} >= "
+                f"total_steps {cfg.train.total_steps} -- raise "
+                f"train.total_steps to continue this run")
         trainer.load_state_dict(bundle['trainer'])
         noise.load_state_dict(bundle['noise'])
         start_step = bundle['env_step']
+        resumed_stage = max(0, int(bundle.get('curriculum_stage', 0)))
+        # Restore the RNG streams so the continued run is a continuation,
+        # not a replay of the stream from step 0.
+        rng_state = bundle.get('rng', {})
+        if rng_state.get('python') is not None:
+            random.setstate(rng_state['python'])
+        if rng_state.get('numpy_legacy') is not None:
+            np.random.set_state(rng_state['numpy_legacy'])
+        if rng_state.get('torch') is not None:
+            torch.set_rng_state(rng_state['torch'])
+        if rng_state.get('numpy_generator') is not None:
+            rng.bit_generator.state = rng_state['numpy_generator']
 
-    if not faithful and start_step == 0:
-        n_demo = prefill_demos(cfg, buf, obs_spec)
+    # Prefill runs on fresh AND resumed runs: the buffer is not persisted
+    # in the bundle, so a resume otherwise takes its first gradient steps
+    # on a handful of fresh transitions (the min-fill counterexample,
+    # offline_training_recipe.md section 5).
+    if not faithful:
+        n_demo = prefill_demos(cfg, buf)
         if n_demo:
             print(f'[demo] prefilled {n_demo} transitions from the '
                   f'P-controller / {cfg.train.demo_dir or "no npz dir"}')
+    # After a resume the update gate also waits for fresh experience.
+    learn_after = max(cfg.train.update_after,
+                      start_step + cfg.train.update_after if resume else 0)
 
-    curriculum = Curriculum(cfg, env) if not faithful else None
+    curriculum = Curriculum(cfg, env, stage=resumed_stage) \
+        if not faithful else None
     eval_env_factory = None
     if not faithful:
         eval_env_factory = default_env_factory(cfg.env)
+    # Diagnostics draw from their own stream: the training rng must not be
+    # perturbed by eval cadence (reproducibility of the seeded run).
+    diag_rng = np.random.default_rng(cfg.seed + 777_000_001)
+    step_dt = obs_spec.control_dt_s
 
     obs, _ = env.reset(seed=cfg.seed)
     noise.reset_episode(rng)
@@ -240,6 +280,7 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
     best = {'tv': -1.0, 'ret': -np.inf}
     evals_since_best = 0
     t0 = time.time()
+    step = start_step
 
     for step in range(start_step + 1, cfg.train.total_steps + 1):
         # ---- act (guide 11.1-11.2) ----
@@ -256,8 +297,7 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
 
         obs2, r, terminated, truncated, _info = env.step(a)
         d_stored = terminated or (truncated and cfg.train.truncation_as_terminal)
-        buf.add(obs, a, r, obs2, d_stored, getattr(env, 'cfg', None).dt
-                if hasattr(env, 'cfg') and hasattr(env.cfg, 'dt') else 0.1)
+        buf.add(obs, a, r, obs2, d_stored, step_dt)
         obs = obs2
         ep_ret += r
         ep_len += 1
@@ -268,9 +308,13 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
             ep_ret, ep_len = 0.0, 0
 
         # ---- learn: one gradient step per env step (guide 19) ----
-        if step >= cfg.train.update_after and len(buf) >= cfg.train.batch:
+        if step >= learn_after and len(buf) >= cfg.train.batch:
             batch = buf.sample(cfg.train.batch, rng)
-            recent_update_metrics = trainer.update(batch)
+            # Dashboard reductions only every 200 grad steps: they cost a
+            # device sync each and are read once per eval.
+            m = trainer.update(batch, compute_metrics=(step % 200 == 0))
+            if m:
+                recent_update_metrics = m
 
         # ---- eval / checkpoint / curriculum / stopping ----
         if step % cfg.eval.every == 0 or step == cfg.train.total_steps:
@@ -290,7 +334,7 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
             # avg_Q vs realised return -- the overestimation dashboard row.
             avg_q = float('nan')
             if len(buf) >= cfg.train.batch:
-                b = buf.sample(cfg.train.batch, rng)
+                b = buf.sample(cfg.train.batch, diag_rng)
                 with torch.no_grad():
                     avg_q = float(trainer.critic.q1(
                         b['obs'], trainer.actor(b['obs'])).mean().item())
@@ -324,7 +368,7 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                     ckpt, trainer=trainer, noise=noise, cfg=cfg,
                     obs_spec=obs_spec, action_map=action_map(cfg),
                     env_config=env_config, env_step=step, eval_snapshot=agg,
-                    curriculum_stage=record['stage'])
+                    curriculum_stage=record['stage'], run_rng=rng)
                 update_best_manifest(run_dir, {
                     'arm': cfg.arm, 'seed': cfg.seed, 'path': ckpt,
                     'env_step': step, 'time_in_view': agg['time_in_view'],
@@ -339,13 +383,37 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                       f'without improvement after curriculum completion')
                 break
 
+    # Held-out report pass: selection (best checkpoint, curriculum,
+    # plateau) all consumed the eval_seed0 suite, so the REPORTED numbers
+    # come from a disjoint seed block (guide 24: never report on seeds
+    # model-selected on).
+    heldout_seed0 = cfg.eval.eval_seed0 + 500_000
+    if faithful:
+        heldout = eval_faithful(trainer,
+                                episodes=cfg.eval.episodes_per_scenario,
+                                eval_seed0=heldout_seed0)
+    else:
+        heldout = run_suite(
+            lambda o: trainer.act(np.asarray(o, dtype=np.float32)),
+            eval_env_factory,
+            episodes_per_family=cfg.eval.episodes_per_scenario,
+            eval_seed0=heldout_seed0)
+    with open(metrics_path, 'a') as f:
+        f.write(json.dumps({'env_step': step, 'final_heldout': heldout,
+                            'heldout_seed0': heldout_seed0}) + '\n')
+    ha = heldout['aggregate']
+    print(f"[held-out] ret {ha['return_mean']:.2f}  "
+          f"tv {ha['time_in_view']:.2%}  (report these, not the "
+          f"selection-suite numbers)")
+
     # Final bundle + ONNX for the best checkpoint.
     final = os.path.join(run_dir, f'{cfg.arm}_s{cfg.seed}_final.pt')
     save_bundle(final, trainer=trainer, noise=noise, cfg=cfg,
                 obs_spec=obs_spec, action_map=action_map(cfg),
                 env_config=env_config, env_step=step,
-                eval_snapshot=best,
-                curriculum_stage=curriculum.stage if curriculum else -1)
+                eval_snapshot={'selection': best, 'heldout': ha},
+                curriculum_stage=curriculum.stage if curriculum else -1,
+                run_rng=rng)
     best_path = os.path.join(run_dir, 'best.json')
     if os.path.exists(best_path):
         with open(best_path) as f:
@@ -356,23 +424,6 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
             print(f'[export] ONNX actor: {onnx_path} (parity checked)')
     print(f'[done] run dir: {run_dir}')
     return run_dir
-
-
-class _FaithfulSpec:
-    """Minimal obs-spec stand-in for the faithful arm: raw pixels, no
-    assembler. Carries the same contract surface the bundle needs."""
-
-    mode = 'raw_pixels'
-    control_dt_s = 0.1
-
-    def to_dict(self) -> dict:
-        return {'mode': 'raw_pixels', 'dim': 2, 'action_dim': 2,
-                'note': 'original [C]: raw box-centre pixels, unnormalised'}
-
-    def spec_hash(self) -> str:
-        import hashlib, json as _json
-        return hashlib.sha256(_json.dumps(
-            self.to_dict(), sort_keys=True).encode()).hexdigest()[:16]
 
 
 def main(argv=None):

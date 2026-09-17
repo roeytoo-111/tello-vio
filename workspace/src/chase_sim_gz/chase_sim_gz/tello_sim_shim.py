@@ -23,13 +23,15 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
+from chase_gym import constants as C
+
 
 class TelloSimShim(Node):
     def __init__(self):
         super().__init__('tello_sim_shim')
         self.declare_parameter('v_max', 1.5)          # m/s  [D safety]
         self.declare_parameter('omega_max', 1.5)      # rad/s
-        self.declare_parameter('deadman_s', 0.35)     # the driver's timeout
+        self.declare_parameter('deadman_s', C.DEADMAN_S)  # driver timeout [V]
         self.declare_parameter('republish_hz', 20.0)  # the driver's RC rate
 
         self.v_max = float(self.get_parameter('v_max').value)

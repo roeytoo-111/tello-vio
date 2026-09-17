@@ -27,6 +27,7 @@ import gymnasium as gym
 import numpy as np
 
 from . import constants as C
+from .observation import ObservationSpec
 
 
 class FaithfulPointMassEnv(gym.Env):
@@ -34,6 +35,17 @@ class FaithfulPointMassEnv(gym.Env):
 
     ACTION_SCALE = 60.0
     STEP_GAIN = 2.0            # position += 2 * action  [C drone_sim_env.py]
+
+    # The same contract surface every env exposes (checkpoint bundles and
+    # the trainer read these uniformly; no special-casing at call sites).
+    obs_spec = ObservationSpec(mode='raw_pixels')
+
+    def env_config_dict(self) -> dict:
+        return {'env': 'FaithfulPointMassEnv',
+                'action_scale': self.ACTION_SCALE,
+                'step_gain': self.STEP_GAIN,
+                'reward_version': 'faithful',
+                'obs_spec': self.obs_spec.to_dict()}
 
     def __init__(self):
         super().__init__()

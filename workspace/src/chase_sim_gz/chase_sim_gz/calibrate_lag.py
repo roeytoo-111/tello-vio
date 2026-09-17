@@ -18,7 +18,7 @@ import sys
 
 import numpy as np
 
-from .gz_iface import FakeGzBackend, GzTransportBackend
+from .gz_iface import add_backend_args, make_backend
 
 AXES = {
     'forward': ((1.0, 0.0, 0.0), 0.0),
@@ -57,21 +57,14 @@ def fit_t_lag(times, vels, v_cmd: float) -> float:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--fake', action='store_true')
-    ap.add_argument('--world', default=None)
+    add_backend_args(ap)
     ap.add_argument('--target-t-lag', type=float, default=0.25,
                     help='the measured Phase-1 T_lag (placeholder 0.25 s '
                          'until the step-response flight exists)')
     ap.add_argument('--out', default='lag_calibration.json')
     args = ap.parse_args(argv)
 
-    if args.fake:
-        backend = FakeGzBackend()
-    else:
-        world = args.world or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'worlds', 'chase.sdf')
-        backend = GzTransportBackend(world)
+    backend = make_backend(args)
     backend.start()
 
     results = {}

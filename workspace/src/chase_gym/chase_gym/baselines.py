@@ -93,9 +93,10 @@ class PNController:
         self.k_v = float(k_v)
         self.k_v_lead = float(k_v_lead)
         self.omega_max = float(omega_max)
+        self._prev_visible = False
 
     def reset(self):
-        pass
+        self._prev_visible = False
 
     def get_action(self, obs: np.ndarray) -> np.ndarray:
         ex, ey = float(obs[0]), float(obs[1])
@@ -103,13 +104,27 @@ class PNController:
         visible = float(obs[4])
         a_h_prev = float(obs[7])         # newest history entry, [a_v, a_h]
         if visible < 0.5:
+            self._prev_visible = False
             return np.zeros(2, dtype=np.float32)
+        # Rate terms only when the PREVIOUS frame was also visible: the
+        # assembler zeroes errors on a miss (anti-ghosting), so the first
+        # frame after a dropout would difference a real bearing against an
+        # artificial zero -- a fabricated LOS rate that saturates the turn
+        # command in the wrong direction exactly when PN must be at its
+        # best. Reacquisition frames fly on the centring terms alone.
+        use_rates = self._prev_visible
+        self._prev_visible = True
         dt = self.spec.control_dt_s
-        # Bearing rate, rad/s, right-positive (small-angle conversion).
-        az_dot = (ex - ex_prev) * self.spec.half_w / C.FX / dt
-        psi_dot = a_h_prev * self.omega_max
-        lambda_dot = psi_dot - az_dot
-        yaw_rate_cmd = self.nav_gain * lambda_dot         # rad/s, CCW+
+        if use_rates:
+            # Bearing rate, rad/s, right-positive (small-angle conversion).
+            az_dot = (ex - ex_prev) * self.spec.half_w / C.FX / dt
+            psi_dot = a_h_prev * self.omega_max
+            lambda_dot = psi_dot - az_dot
+            yaw_rate_cmd = self.nav_gain * lambda_dot     # rad/s, CCW+
+            lead_v = -self.k_v_lead * (ey - ey_prev)
+        else:
+            yaw_rate_cmd = 0.0
+            lead_v = 0.0
         a_h = yaw_rate_cmd / self.omega_max - self.k_center * ex
-        a_v = -self.k_v * ey - self.k_v_lead * (ey - ey_prev)
+        a_v = -self.k_v * ey + lead_v
         return np.clip(np.array([a_v, a_h], dtype=np.float32), -1.0, 1.0)

@@ -41,14 +41,13 @@ class DelayQueue:
 
     def sample(self, t: float) -> Optional[tuple]:
         """(t_meas, payload) of the newest entry with t_meas <= t, else None
-        (the pipe is still empty at episode start unless pre-rolled)."""
-        result = None
-        for t_meas, payload in self._q:
+        (the pipe is still empty at episode start unless pre-rolled).
+        Scans from the newest end: the answer sits ~2-4 entries in at the
+        measured delays, vs ~20 from the old end."""
+        for t_meas, payload in reversed(self._q):
             if t_meas <= t:
-                result = (t_meas, payload)
-            else:
-                break
-        return result
+                return (t_meas, payload)
+        return None
 
 
 class LatencyModel:

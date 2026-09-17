@@ -27,7 +27,7 @@ from chase_train.config import RunConfig, _build
 from chase_train.noise import GaussianNoise
 from chase_train.train import build_trainer, seed_everything
 
-from .gz_iface import FakeGzBackend, GzTransportBackend
+from .gz_iface import add_backend_args, make_backend
 from .gz_chase_env import GzChaseEnv
 
 
@@ -35,8 +35,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--checkpoint', required=True,
                     help='Tier-A bundle to continue from')
-    ap.add_argument('--fake', action='store_true')
-    ap.add_argument('--world', default=None)
+    add_backend_args(ap)
     ap.add_argument('--steps', type=int, default=10_000)
     ap.add_argument('--sigma', type=float, default=0.05,
                     help='exploration noise for the fine-tune (small: the '
@@ -52,14 +51,7 @@ def main(argv=None):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     env_cfg = EnvConfig(**cfg.env)
-    if args.fake:
-        backend = FakeGzBackend()
-    else:
-        world = args.world or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'worlds', 'chase.sdf')
-        backend = GzTransportBackend(world)
-    env = GzChaseEnv(backend, env_cfg)
+    env = GzChaseEnv(make_backend(args), env_cfg)
 
     # The bundle's spec must match what THIS env produces -- the refusal.
     load_bundle(args.checkpoint, expect_obs_spec=env.obs_spec)

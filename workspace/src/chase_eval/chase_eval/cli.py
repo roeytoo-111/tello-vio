@@ -17,7 +17,7 @@ import numpy as np
 
 from chase_gym import ChaseEnv, EnvConfig, PController, PNController
 
-from .evaluate import default_env_factory, run_suite
+from .evaluate import ActorPolicy, default_env_factory, run_suite
 
 
 def _print_table(suite: dict) -> None:
@@ -50,7 +50,6 @@ def main(argv=None):
     if args.checkpoint:
         # Lazy import: chase_train depends on chase_eval, not the reverse.
         from chase_train.checkpoint import actor_from_bundle, load_bundle
-        import torch
         bundle = load_bundle(args.checkpoint)
         env_kwargs = {k: v for k, v in bundle['config']['env'].items()}
         if args.task:
@@ -63,12 +62,7 @@ def main(argv=None):
         # compare hashes (guide 19).
         probe = ChaseEnv(EnvConfig(**env_kwargs))
         load_bundle(args.checkpoint, expect_obs_spec=probe.obs_spec)
-        actor = actor_from_bundle(bundle)
-
-        def policy(obs):
-            with torch.no_grad():
-                t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
-                return actor(t).squeeze(0).numpy()
+        policy = ActorPolicy(actor_from_bundle(bundle))
         label = os.path.basename(args.checkpoint)
         out_path = args.out or args.checkpoint.replace(
             '.pt', '_eval_result.json')

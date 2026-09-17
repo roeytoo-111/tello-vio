@@ -23,12 +23,13 @@ import gymnasium as gym
 import numpy as np
 
 from chase_gym import constants as C
-from chase_gym.corruption import CorruptionModel, Measurement
-from chase_gym.env import EnvConfig, forward_command
+from chase_gym.corruption import Measurement
+from chase_gym.env import EnvConfig, forward_command, reward_config_from
 from chase_gym.kinematics import FollowerState, project, world_to_camera
-from chase_gym.latency import DelayQueue, LatencyModel
 from chase_gym.observation import ObservationAssembler, ObservationSpec
-from chase_gym.reward import RewardComputer, RewardConfig
+from chase_gym.pipeline import (MeasurementPipe, body_offset_from_frame_draw,
+                                draw_reset_placement)
+from chase_gym.reward import RewardComputer
 from chase_gym import target_motion
 
 from .gz_iface import GzBackendBase
@@ -57,18 +58,8 @@ class GzChaseEnv(gym.Env):
         self.obs_spec = ObservationSpec(mode=self.cfg.obs_mode, k=self.cfg.k,
                                         control_dt_s=self.cfg.dt)
         self._assembler = ObservationAssembler(self.obs_spec)
-        self._reward = RewardComputer(RewardConfig(
-            version=self.cfg.reward_version, w_smooth=self.cfg.w_smooth,
-            w_loss=self.cfg.w_loss, intercept=(self.cfg.task == 'intercept'),
-            gamma=self.cfg.gamma, shaping_lambda=self.cfg.shaping_lambda,
-            capture_bonus=self.cfg.capture_bonus))
-        self._latency = LatencyModel(
-            enabled=self.cfg.latency, base_range_s=self.cfg.latency_range_s,
-            jitter_std_s=self.cfg.latency_jitter_std_s)
-        corr = self.cfg.corruption_cfg
-        corr.enabled = corr.enabled and self.cfg.corruption
-        self._corruption = CorruptionModel(corr)
-        self._queue = DelayQueue()
+        self._reward = RewardComputer(reward_config_from(self.cfg))
+        self._pipe = MeasurementPipe.from_env_cfg(self.cfg)
 
         self.observation_space = gym.spaces.Box(
             -np.ones(self.obs_spec.dim, dtype=np.float32),
@@ -85,10 +76,6 @@ class GzChaseEnv(gym.Env):
         self._stage_cap = float(speed_cap)
 
     # ------------------------------------------------------------------
-    def _follower_state(self) -> FollowerState:
-        od = self.backend.get_odom(self.follower)
-        return FollowerState(pos=od.pos, yaw=od.yaw)
-
     def _project_truth(self):
         od_f = self.backend.get_odom(self.follower)
         od_t = self.backend.get_odom(self.target)
@@ -109,25 +96,17 @@ class GzChaseEnv(gym.Env):
             self._started = True
         self.backend.reset_world()
 
-        # DRAW ORDER CONTRACT (see ChaseEnv.reset): placement first, then
-        # family, then tier-specific draws -- one seed, one geometry, every
-        # tier; the A<->B replay gate depends on it.
-        r_lo, r_hi = cfg.resolved_reset_range()
-        z_cam = rng.uniform(r_lo, r_hi)
-        m = cfg.reset_frame_margin
-        u0 = rng.uniform(C.FRAME_W * m, C.FRAME_W * (1.0 - m))
-        v0 = rng.uniform(C.FRAME_H * m, C.FRAME_H * (1.0 - m))
-        family = str(rng.choice(list(self._stage_families)))
-
-        self._latency.reset(rng)
-        self._corruption.reset()
+        # Steps 1-4 of the DRAW ORDER CONTRACT (chase_gym.pipeline):
+        # exactly ChaseEnv's shared draw prefix -- one seed, one geometry,
+        # one latency base, one generator, in every tier.
+        z_cam, u0, v0, family = draw_reset_placement(
+            rng, cfg.resolved_reset_range(), cfg.reset_frame_margin,
+            self._stage_families)
+        self._pipe.reset(rng)
         self._assembler.reset()
-        self._queue.clear()
 
-        x_cam = (u0 - C.CX) * z_cam / C.FX
-        y_cam = (v0 - C.CY) * z_cam / C.FY
         f_pos = np.array([0.0, 0.0, 1.0])
-        t_pos = f_pos + np.array([z_cam, -x_cam, -y_cam])
+        t_pos = f_pos + body_offset_from_frame_draw(z_cam, u0, v0)
         t_pos[2] = max(t_pos[2], 0.2)
         self.backend.set_pose(self.follower, f_pos, 0.0)
         self.backend.set_pose(self.target, t_pos, 0.0)
@@ -143,13 +122,10 @@ class GzChaseEnv(gym.Env):
 
         # Pre-roll the delay pipe with the settled initial view.
         u, v, w_px, in_frame, dist, rng_m, _ = self._project_truth()
-        n_pre = int(math.ceil(
-            (cfg.latency_range_s[1] + 4 * cfg.latency_jitter_std_s)
-            / cfg.dt)) + 1
         t0 = self.backend.sim_time()
-        if in_frame:
-            for i in range(n_pre, 0, -1):
-                self._queue.push(t0 - i * cfg.dt, Measurement(u, v, w_px))
+        self._pipe.preroll(t0, cfg.dt,
+                           Measurement(u, v, w_px) if in_frame else None,
+                           cfg.latency_range_s[1], cfg.latency_jitter_std_s)
         self._prev_range = rng_m
         self._a_prev = np.zeros(2, dtype=np.float32)
         self._steps = 0
@@ -157,12 +133,11 @@ class GzChaseEnv(gym.Env):
         self._last_meas = meas
         obs = self._assembler.assemble(meas, cfg.dt)
         return obs, {'family': family, 'in_frame': in_frame,
-                     'range_m': rng_m, 'latency_base_s': self._latency.base_s}
+                     'range_m': rng_m,
+                     'latency_base_s': self._pipe.latency_base_s}
 
     def _sample_pipe(self, t: float, rng) -> Optional[Measurement]:
-        delayed = self._queue.sample(t - self._latency.delay(rng))
-        payload = delayed[1] if delayed is not None else None
-        return self._corruption.apply(payload, rng)
+        return self._pipe.sample(t, rng)
 
     def step(self, action):
         cfg = self.cfg
@@ -200,7 +175,7 @@ class GzChaseEnv(gym.Env):
 
         u, v, w_px, in_frame, dist, rng_m, _ = self._project_truth()
         if in_frame:
-            self._queue.push(t, Measurement(u, v, w_px))
+            self._pipe.push(t, Measurement(u, v, w_px))
         meas = self._sample_pipe(t, rng)
         self._last_meas = meas
         self._assembler.record_action(a)

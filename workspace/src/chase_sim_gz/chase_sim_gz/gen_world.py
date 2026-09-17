@@ -25,10 +25,13 @@ reported inverted, open and unconfirmed upstream).
 import math
 import os
 
+from chase_gym import constants as C
+
 # ---- Tello parameterisation (one place) ---------------------------------
 MASS_BASE = 0.060          # kg; + 4 rotors = 0.080 total [V]
 MASS_ROTOR = 0.005
-BODY = (0.098, 0.098, 0.041)       # m; depth ~= width [V width/height]
+# Body extents come from the shared constants (depth ~= width [V]).
+BODY = (C.TELLO_BODY_W, C.TELLO_BODY_W, C.TELLO_BODY_H)
 ARM = 0.045                # rotor offset on x and y, m (prop span 0.18 [V])
 ROTOR_Z = 0.024
 ROTOR_RADIUS = 0.038
