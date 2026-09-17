@@ -39,10 +39,18 @@ class GaussianNoise:
         return eps.astype(np.float32)
 
     def state_dict(self) -> dict:
-        return {'type': 'gaussian', 'step': self._step}
+        # The schedule params travel with the state: a sanctioned
+        # continuation (raised total_steps) must keep the ORIGINAL decay
+        # horizon, not re-derive one from the new total.
+        return {'type': 'gaussian', 'step': self._step,
+                'sigma0': self.sigma0, 'sigma_min': self.sigma_min,
+                'decay_steps': self.decay_steps}
 
     def load_state_dict(self, d: dict) -> None:
         self._step = int(d['step'])
+        self.sigma0 = float(d.get('sigma0', self.sigma0))
+        self.sigma_min = float(d.get('sigma_min', self.sigma_min))
+        self.decay_steps = int(d.get('decay_steps', self.decay_steps))
 
 
 class OUNoise:

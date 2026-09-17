@@ -110,6 +110,9 @@ class TD3:
                 'q1_mean': float(qs[0].mean().item()),
                 'q_max': float(qs[0].max().item()),
                 'td_abs_mean': float((y - qs[0]).abs().mean().item()),
+                # Heavy tails here flag a reward discontinuity or
+                # mislabelled terminals (guide 23, TD-delta row).
+                'td_abs_p95': float((y - qs[0]).abs().quantile(0.95).item()),
             }
             if len(qs) == 2:
                 metrics['q_gap'] = float((qs[0] - qs[1]).abs().mean().item())

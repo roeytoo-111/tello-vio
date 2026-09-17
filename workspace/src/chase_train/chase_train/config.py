@@ -62,6 +62,8 @@ class EvalCfg:
     every: int = 5000
     episodes_per_scenario: int = 10
     eval_seed0: int = 10_000          # disjoint from training seeds
+    plateau_enabled: bool = True      # faithful arm: False (the original
+                                      # ran its 1e5 steps unconditionally)
     plateau_evals: int = 5            # stopping rule (recipe stage 3)
     plateau_epsilon: float = 0.005
 

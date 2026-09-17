@@ -52,7 +52,9 @@ class Actor(nn.Module):
         self.body = nn.Sequential(*layers)
         self.head = nn.Linear(dims[-1], act_dim)
         if faithful_init:
-            _final_init(self.head, 0.05)     # keras RandomUniform default
+            # keras Dense: RandomUniform(+/-0.05) KERNEL, zeros BIAS.
+            nn.init.uniform_(self.head.weight, -0.05, 0.05)
+            nn.init.zeros_(self.head.bias)
         else:
             _final_init(self.head, final_init)
         self.action_scale = float(action_scale)
@@ -65,6 +67,9 @@ class _QNet(nn.Module):
     def __init__(self, obs_dim: int, act_dim: int, hidden: List[int],
                  final_init: float, faithful_init: bool):
         super().__init__()
+        # Faithful arm concatenates (action, obs) like the original
+        # [C rl_drone.py:40]; deployment arms use the modern (obs, action).
+        self.action_first = faithful_init
         dims = [obs_dim + act_dim] + list(hidden)
         layers: List[nn.Module] = []
         for i in range(len(dims) - 1):
@@ -83,7 +88,8 @@ class _QNet(nn.Module):
         # Standard nn.Sequential MLP with the action at the input concat --
         # NEVER the reference's detached-weight construction
         # (drl_ros2_reference_analysis.md 2.1: half its critic never trained).
-        return self.head(self.body(torch.cat([obs, act], dim=-1)))
+        pair = [act, obs] if self.action_first else [obs, act]
+        return self.head(self.body(torch.cat(pair, dim=-1)))
 
 
 class CriticEnsemble(nn.Module):

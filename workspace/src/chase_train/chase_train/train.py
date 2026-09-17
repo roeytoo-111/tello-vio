@@ -165,6 +165,32 @@ class Curriculum:
             self._apply()
 
 
+def eval_faithful_actor(act_fn, episodes: int = 20,
+                        eval_seed0: int = 10_000) -> dict:
+    """eval_faithful over any act(obs)->action callable (used for the
+    best-checkpoint held-out pass)."""
+    env = gymnasium.wrappers.TimeLimit(FaithfulPointMassEnv(),
+                                       max_episode_steps=FAITHFUL_EPISODE_CAP)
+    rets, lens = [], []
+    for e in range(episodes):
+        obs, _ = env.reset(seed=eval_seed0 + e)
+        total, steps = 0.0, 0
+        while True:
+            a = act_fn(np.asarray(obs, dtype=np.float32))
+            obs, r, term, trunc, _ = env.step(a)
+            total += r
+            steps += 1
+            if term or trunc:
+                break
+        rets.append(total)
+        lens.append(steps)
+    tv = float(np.mean(lens)) / FAITHFUL_EPISODE_CAP
+    return {'families': {}, 'aggregate': {
+        'return_mean': float(np.mean(rets)),
+        'time_in_view': tv, 'loss_rate': float('nan'),
+        'capture_rate': 0.0, 'mean_episode_len': float(np.mean(lens))}}
+
+
 def eval_faithful(trainer: TD3, episodes: int = 20,
                   eval_seed0: int = 10_000) -> dict:
     """Arm F is scored in its own world: return and survival, exploration
@@ -249,6 +275,8 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
             torch.set_rng_state(rng_state['torch'])
         if rng_state.get('numpy_generator') is not None:
             rng.bit_generator.state = rng_state['numpy_generator']
+        if rng_state.get('torch_cuda') is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng_state['torch_cuda'])
 
     # Prefill runs on fresh AND resumed runs: the buffer is not persisted
     # in the bundle, so a resume otherwise takes its first gradient steps
@@ -274,6 +302,13 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
     step_dt = obs_spec.control_dt_s
 
     obs, _ = env.reset(seed=cfg.seed)
+    if resume:
+        # Continue the env's own episode stream instead of replaying it
+        # from the seed (the bundle carries the env generator state).
+        env_rng = bundle['rng'].get('env_generator')
+        if env_rng is not None:
+            env.unwrapped.np_random.bit_generator.state = env_rng
+            obs, _ = env.reset()
     noise.reset_episode(rng)
     ep_ret, ep_len = 0.0, 0
     recent_update_metrics: dict = {}
@@ -312,7 +347,9 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
             batch = buf.sample(cfg.train.batch, rng)
             # Dashboard reductions only every 200 grad steps: they cost a
             # device sync each and are read once per eval.
-            m = trainer.update(batch, compute_metrics=(step % 200 == 0))
+            # <=1: cover BOTH gradient-step parities, or with policy_delay=2
+            # the actor_loss row would never land on a metrics step.
+            m = trainer.update(batch, compute_metrics=(step % 200 <= 1))
             if m:
                 recent_update_metrics = m
 
@@ -368,7 +405,8 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                     ckpt, trainer=trainer, noise=noise, cfg=cfg,
                     obs_spec=obs_spec, action_map=action_map(cfg),
                     env_config=env_config, env_step=step, eval_snapshot=agg,
-                    curriculum_stage=record['stage'], run_rng=rng)
+                    curriculum_stage=record['stage'], run_rng=rng,
+                    env_rng_state=env.unwrapped.np_random.bit_generator.state)
                 update_best_manifest(run_dir, {
                     'arm': cfg.arm, 'seed': cfg.seed, 'path': ckpt,
                     'env_step': step, 'time_in_view': agg['time_in_view'],
@@ -378,31 +416,50 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                 evals_since_best += 1
 
             done_curriculum = curriculum.at_final if curriculum else True
-            if done_curriculum and evals_since_best >= cfg.eval.plateau_evals:
+            if (cfg.eval.plateau_enabled and done_curriculum
+                    and evals_since_best >= cfg.eval.plateau_evals):
                 print(f'[stop] eval plateau: {evals_since_best} evals '
                       f'without improvement after curriculum completion')
                 break
 
-    # Held-out report pass: selection (best checkpoint, curriculum,
-    # plateau) all consumed the eval_seed0 suite, so the REPORTED numbers
-    # come from a disjoint seed block (guide 24: never report on seeds
-    # model-selected on).
+    # Held-out report pass on the DELIVERABLE: selection (best checkpoint,
+    # curriculum, plateau) all consumed the eval_seed0 suite, so the
+    # REPORTED numbers come from a disjoint seed block (guide 24) -- and
+    # they must describe the best-selected checkpoint, which is what ships,
+    # not whatever weights the plateau stop left in memory.
     heldout_seed0 = cfg.eval.eval_seed0 + 500_000
+    heldout_actor = trainer.act
+    heldout_subject = 'final weights (no best checkpoint saved)'
+    best_path = os.path.join(run_dir, 'best.json')
+    if os.path.exists(best_path):
+        from .checkpoint import actor_from_bundle
+        with open(best_path) as f:
+            best_entry = json.load(f)
+        _best_actor = actor_from_bundle(load_bundle(best_entry['path']))
+
+        def heldout_actor(o):
+            with torch.no_grad():
+                t = torch.as_tensor(o, dtype=torch.float32).unsqueeze(0)
+                return _best_actor(t).squeeze(0).numpy()
+        heldout_subject = os.path.basename(best_entry['path'])
     if faithful:
         heldout = eval_faithful(trainer,
                                 episodes=cfg.eval.episodes_per_scenario,
-                                eval_seed0=heldout_seed0)
+                                eval_seed0=heldout_seed0) \
+            if not os.path.exists(best_path) else eval_faithful_actor(
+                heldout_actor, episodes=cfg.eval.episodes_per_scenario,
+                eval_seed0=heldout_seed0)
     else:
         heldout = run_suite(
-            lambda o: trainer.act(np.asarray(o, dtype=np.float32)),
-            eval_env_factory,
+            heldout_actor, eval_env_factory,
             episodes_per_family=cfg.eval.episodes_per_scenario,
             eval_seed0=heldout_seed0)
     with open(metrics_path, 'a') as f:
         f.write(json.dumps({'env_step': step, 'final_heldout': heldout,
-                            'heldout_seed0': heldout_seed0}) + '\n')
+                            'heldout_seed0': heldout_seed0,
+                            'heldout_subject': heldout_subject}) + '\n')
     ha = heldout['aggregate']
-    print(f"[held-out] ret {ha['return_mean']:.2f}  "
+    print(f"[held-out] {heldout_subject}: ret {ha['return_mean']:.2f}  "
           f"tv {ha['time_in_view']:.2%}  (report these, not the "
           f"selection-suite numbers)")
 
@@ -413,13 +470,14 @@ def train(cfg: RunConfig, resume: Optional[str] = None) -> str:
                 env_config=env_config, env_step=step,
                 eval_snapshot={'selection': best, 'heldout': ha},
                 curriculum_stage=curriculum.stage if curriculum else -1,
-                run_rng=rng)
-    best_path = os.path.join(run_dir, 'best.json')
+                run_rng=rng,
+                env_rng_state=env.unwrapped.np_random.bit_generator.state)
     if os.path.exists(best_path):
         with open(best_path) as f:
             best_entry = json.load(f)
-        onnx_path = export_onnx(load_bundle(best_entry['path']),
-                                best_entry['path'].replace('.pt', '.onnx'))
+        onnx_path = export_onnx(
+            load_bundle(best_entry['path']),
+            os.path.splitext(best_entry['path'])[0] + '.onnx')
         if onnx_path:
             print(f'[export] ONNX actor: {onnx_path} (parity checked)')
     print(f'[done] run dir: {run_dir}')

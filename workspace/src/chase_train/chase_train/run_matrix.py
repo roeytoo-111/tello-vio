@@ -38,9 +38,14 @@ CONFIG_DIR = _config_dir()
 
 
 def run_cell(arm: str, seed: int, extra_overrides, out_root: str) -> dict:
-    config = os.path.join(CONFIG_DIR, f'{arm}.yaml')
-    cmd = [sys.executable, '-m', 'chase_train.train', '--config', config,
-           '--seed', str(seed)]
+    if arm == 'sb3_check':
+        config = os.path.join(CONFIG_DIR, 'td3.yaml')
+        cmd = [sys.executable, '-m', 'chase_train.sb3_check', '--config',
+               config, '--seed', str(seed)]
+    else:
+        config = os.path.join(CONFIG_DIR, f'{arm}.yaml')
+        cmd = [sys.executable, '-m', 'chase_train.train', '--config', config,
+               '--seed', str(seed)]
     overrides = list(extra_overrides) + [f'out_root={out_root}']
     cmd += ['--override'] + overrides
     t0 = time.time()
@@ -65,9 +70,16 @@ def main(argv=None):
     ap.add_argument('--jobs', type=int, default=1)
     ap.add_argument('--out-root', default='runs')
     ap.add_argument('--override', nargs='*', default=[])
+    ap.add_argument('--with-sb3', action='store_true',
+                    help='add the SB3 TD3 cross-check per seed '
+                         '(recipe stage 3: the 4th arm)')
+    ap.add_argument('--report', action='store_true', default=True,
+                    help='aggregate IQM/CI + 28.4 acceptance at the end')
     args = ap.parse_args(argv)
 
     cells = [(arm, seed) for arm in args.arms for seed in args.seeds]
+    if args.with_sb3:
+        cells += [('sb3_check', seed) for seed in args.seeds]
     print(f'matrix: {len(cells)} runs ({len(args.arms)} arms x '
           f'{len(args.seeds)} seeds), jobs={args.jobs}')
     results = []
@@ -87,6 +99,9 @@ def main(argv=None):
     failed = [r for r in results if not r['ok']]
     print(f'matrix complete: {len(results) - len(failed)}/{len(results)} ok; '
           f'index: {index_path}')
+    if args.report and len(results) > len(failed):
+        from .report_matrix import main as report_main
+        report_main(['--runs', args.out_root])
     return 1 if failed else 0
 
 

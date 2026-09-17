@@ -199,7 +199,8 @@ class GzTransportBackend(GzBackendBase):
         behind the boundary -- silently breaking reward/termination truth
         and the one-seed-one-geometry contract on the real backend (the
         kinematic fake, with instant odometry, cannot show this)."""
-        target = self.sim_time() + iterations * self.physics_dt
+        start = self.sim_time()
+        target = start + iterations * self.physics_dt
         self._control(pause=True, multi_step=iterations)
         deadline = time.time() + self.step_timeout_s
         with self._clock_cv:
@@ -210,14 +211,22 @@ class GzTransportBackend(GzBackendBase):
                         f'lockstep: sim time {self._sim_time:.4f} never '
                         f'reached {target:.4f}')
                 self._clock_cv.wait(min(remaining, 0.5))
-        self._wait_odoms(target, deadline)
+        # Freshness bound: a step spanning >= one odom period GUARANTEES a
+        # publish inside it, so demand a stamp strictly after the step
+        # started -- a target-relative slack would accept pre-step (e.g.
+        # pre-teleport) poses on short settle steps. Shorter steps cannot
+        # guarantee a fresh sample; fall back to the target-relative bound.
+        if iterations * self.physics_dt >= self.ODOM_PERIOD_S:
+            want = start + 0.25 * self.physics_dt
+        else:
+            want = target - 1.5 * self.ODOM_PERIOD_S
+        self._wait_odoms(want, deadline)
 
     # OdometryPublisher runs at 100 Hz SIM time (world SDF), so the newest
     # sample can lag the step boundary by at most one period.
     ODOM_PERIOD_S = 0.010
 
-    def _wait_odoms(self, target_t: float, deadline: float) -> None:
-        want = target_t - 1.5 * self.ODOM_PERIOD_S
+    def _wait_odoms(self, want: float, deadline: float) -> None:
         while True:
             stale = [m for m in self.models
                      if self._odom.get(m) is None
@@ -232,18 +241,24 @@ class GzTransportBackend(GzBackendBase):
             time.sleep(0.001)
 
     def reset_world(self) -> None:
+        pre = self.sim_time()
         self._control(pause=True, reset_all=True)
         # The rewind applies on the next loop iteration while paused; wait
-        # until the (unthrottled, publishes-while-paused) clock actually
-        # shows the rewound time, then re-arm the re-Configured controllers
-        # with a zero command and flush with one step.
-        deadline = time.time() + self.step_timeout_s
-        with self._clock_cv:
-            self._sim_time = float('inf')      # ignore pre-reset callbacks
-            while self._sim_time > 0.5:
-                if time.time() > deadline:
-                    raise TimeoutError('world reset never rewound sim time')
-                self._clock_cv.wait(0.5)
+        # until the (unthrottled, publishes-while-paused) clock shows a
+        # time BELOW the pre-reset time -- an absolute threshold would be
+        # satisfied by a stale pre-reset callback whenever the world had
+        # only run briefly. If the world never advanced, there is nothing
+        # to rewind and nothing to wait for.
+        if pre > 0.0:
+            deadline = time.time() + self.step_timeout_s
+            rewound_below = min(0.5 * pre, 0.5)
+            with self._clock_cv:
+                self._sim_time = float('inf')  # ignore pre-reset callbacks
+                while self._sim_time > rewound_below:
+                    if time.time() > deadline:
+                        raise TimeoutError(
+                            'world reset never rewound sim time')
+                    self._clock_cv.wait(0.5)
         self._odom.clear()                     # pre-reset poses are stale
         for model in self.models:
             self.send_twist(model, (0.0, 0.0, 0.0), 0.0)
@@ -359,11 +374,14 @@ def add_backend_args(ap) -> None:
                     help=f'world SDF for the real backend '
                          f'(default: {DEFAULT_WORLD})')
     ap.add_argument('--partition', default=None,
-                    help='GZ_PARTITION for concurrent instances')
+                    help='GZ_PARTITION (default: chase-<pid>, so two '
+                         'concurrent scripts never share transport)')
 
 
 def make_backend(args, **fake_kwargs) -> GzBackendBase:
     if args.fake:
         return FakeGzBackend(**fake_kwargs)
+    import os as _os
+    partition = args.partition or f'chase-{_os.getpid()}'
     return GzTransportBackend(args.world or DEFAULT_WORLD,
-                              partition=args.partition)
+                              partition=partition)

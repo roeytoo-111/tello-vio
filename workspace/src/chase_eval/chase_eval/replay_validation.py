@@ -60,6 +60,9 @@ def load_detections(path: str) -> List[dict]:
                 rows.append({'t': int(row['t_capture_ns']) * 1e-9,
                              'cx': float(row['cx']), 'cy': float(row['cy']),
                              'w': float(row['w'])})
+    # Rosbag exports are not guaranteed time-ordered, and everything
+    # downstream (t0 anchoring, dets[:n_anchor], bisect) assumes order.
+    rows.sort(key=lambda r: r['t'])
     return rows
 
 
@@ -69,7 +72,8 @@ def load_commands(path: str) -> List[dict]:
         for row in csv.DictReader(f):
             rows.append({'t': int(row['t_ns']) * 1e-9,
                          'a_v': float(row['a_v']), 'a_h': float(row['a_h']),
-                         'v_fwd': float(row.get('v_fwd', 0.0))})
+                         'v_fwd': float(row.get('v_fwd', 0.0) or 0.0)})
+    rows.sort(key=lambda r: r['t'])
     return rows
 
 
@@ -88,8 +92,15 @@ def integrate_states(commands: List[dict], t_lag: float, v_max: float,
     snaps = [Snapshot(0.0, fk.state.pos.copy(), fk.state.yaw)]
     for i in range(1, len(commands)):
         dt = commands[i]['t'] - commands[i - 1]['t']
-        if not (0.0 < dt < 1.0):
-            continue
+        if dt <= 0.0:
+            continue                      # duplicate timestamp after sort
+        if dt >= 1.0:
+            # A >=1 s hole in a 10-20 Hz command log means the recording
+            # broke; replaying across it silently would score every later
+            # detection against a diverged pose.
+            raise ValueError(
+                f'command log has a {dt:.2f}s gap at t={commands[i]["t"]:.2f}'
+                f' -- trim the log to a contiguous segment')
         c = commands[i - 1]
         t_base = commands[i - 1]['t'] - t0
         for j in range(1, n_sub + 1):
@@ -122,25 +133,43 @@ def back_project(det: dict, st: FollowerState) -> np.ndarray:
 def validate(dets: List[dict], cmds: List[dict], t_lag: float,
              v_max: float, omega_max: float,
              n_anchor: int = 10) -> dict:
-    """The gate computation. Returns per-frame errors and the estimate."""
+    """The gate computation: centre errors AND width errors per frame.
+
+    The width term is what validates the FORWARD-axis dynamics -- a pilot
+    who keeps a static target centred leaves the centre error blind to
+    range errors, but the box width w = fx*W/z is not."""
     t0 = cmds[0]['t']
     dets = [dict(d, t=d['t'] - t0) for d in dets if d['t'] >= t0]
+    if len(dets) < max(n_anchor, 20):
+        raise ValueError(
+            f'only {len(dets)} detections overlap the command log '
+            f'(>= {max(n_anchor, 20)} required for a verdict)')
+    # The anchor estimate assumes the follower is AT REST when the log
+    # starts (integrate_states starts from hover). Warn loudly if the log
+    # opens with live commands -- the estimate would be biased.
+    warm = [c for c in cmds if c['t'] - t0 <= 0.5]
+    if warm and max(max(abs(c['a_v']), abs(c['a_h']), abs(c['v_fwd']))
+                    for c in warm) > 0.05:
+        print('WARNING: command log starts with non-zero commands; the '
+              'static-target anchor assumes an at-rest start -- trim the '
+              'log to begin at hover or expect a biased estimate',
+              file=sys.stderr)
     snaps = integrate_states(cmds, t_lag, v_max, omega_max)
     times = [s.t for s in snaps]
 
-    # Static-target estimate from the earliest frames, where the replayed
-    # state is ~the initial pose whatever the dynamics constants are.
     anchors = dets[:n_anchor]
     est = np.median(np.stack([
         back_project(d, state_at(snaps, times, d['t']).state())
         for d in anchors]), axis=0)
 
-    errors = []
+    errors, width_errors = [], []
     for d in dets:
         st = state_at(snaps, times, d['t']).state()
         u, v, w_px, in_frame = project(world_to_camera(est, st))
         errors.append(math.hypot(u - d['cx'], v - d['cy']))
-    return {'target_estimate': est.tolist(), 'errors_px': errors}
+        width_errors.append(abs(w_px - d['w']))
+    return {'target_estimate': est.tolist(), 'errors_px': errors,
+            'width_errors_px': width_errors}
 
 
 def main(argv=None):
@@ -168,21 +197,28 @@ def main(argv=None):
               f'commands', file=sys.stderr)
         return 2
 
-    res = validate(dets, cmds, args.t_lag, args.v_max, args.omega_max)
+    try:
+        res = validate(dets, cmds, args.t_lag, args.v_max, args.omega_max)
+    except ValueError as e:
+        print(f'replay validation refused: {e}', file=sys.stderr)
+        return 2
     err = res['errors_px']
+    werr = res['width_errors_px']
     median = float(np.median(err))
     p90 = float(np.percentile(err, 90))
-    ok = median <= args.tolerance_px
+    w_median = float(np.median(werr))
+    ok = median <= args.tolerance_px and w_median <= args.tolerance_px
     result = {'frames': len(err), 'median_px': median, 'p90_px': p90,
+              'width_median_px': w_median,
               'tolerance_px': args.tolerance_px, 'pass': ok,
               't_lag': args.t_lag,
               'target_estimate_m': res['target_estimate'],
               'protocol': 'static-target [D-impl]'}
     with open(args.out, 'w') as f:
         json.dump(result, f, indent=2)
-    print(f'replay validation: median {median:.2f} px, p90 {p90:.2f} px '
-          f'over {len(err)} frames -> {"PASS" if ok else "FAIL"} '
-          f'({args.out})')
+    print(f'replay validation: centre median {median:.2f} px (p90 '
+          f'{p90:.2f}), width median {w_median:.2f} px over {len(err)} '
+          f'frames -> {"PASS" if ok else "FAIL"} ({args.out})')
     return 0 if ok else 1
 
 
@@ -199,9 +235,12 @@ def _synthetic_flight(t_lag_true: float, seed: int = 0
     det_dt, cmd_dt = 1.0 / 30.0, 0.1
     t, next_det = 0.0, 0.0
     for k in range(200):
-        a_v = 0.3 * math.sin(0.7 * t)
-        a_h = 0.25 * math.sin(0.4 * t + 1.0)
-        v_fwd = 0.2 * math.sin(0.3 * t)
+        if t < 0.6:                      # hover lead-in: the protocol's
+            a_v = a_h = v_fwd = 0.0      # at-rest anchor assumption
+        else:
+            a_v = 0.3 * math.sin(0.7 * (t - 0.6))
+            a_h = 0.25 * math.sin(0.4 * (t - 0.6) + 1.0)
+            v_fwd = 0.2 * math.sin(0.3 * (t - 0.6))
         cmds.append({'t': t, 'a_v': a_v, 'a_h': a_h, 'v_fwd': v_fwd})
         # integrate the "real" aircraft at fine steps, emitting detections
         for _ in range(10):
@@ -221,19 +260,46 @@ def _synthetic_flight(t_lag_true: float, seed: int = 0
 
 
 def self_test(tolerance_px: float) -> int:
-    """Runs the REAL validate() pipeline on a synthetic flight, both
-    directions: the true T_lag must pass; a 3x-wrong T_lag must be
-    measurably worse (the gate detects dynamics error, not just noise)."""
+    """Runs the REAL pipeline -- CSV loaders included -- on a synthetic
+    flight, both directions: the true T_lag must pass; a 3x-wrong T_lag
+    must be measurably worse (the gate detects dynamics error, not just
+    noise)."""
+    import os
+    import tempfile
     t_true = 0.25
-    dets, cmds = _synthetic_flight(t_true)
+    dets_mem, cmds_mem = _synthetic_flight(t_true)
+    # Round-trip through the exact on-disk schema (integer nanoseconds,
+    # detected flag, epoch-scale offsets) so the loaders are exercised.
+    epoch_ns = 1_700_000_000_000_000_000
+    with tempfile.TemporaryDirectory() as td:
+        dpath = os.path.join(td, 'detections.csv')
+        cpath = os.path.join(td, 'commands.csv')
+        with open(dpath, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['t_capture_ns', 'detected', 'cx', 'cy', 'w'])
+            for d in reversed(dets_mem):      # unordered on purpose
+                w.writerow([epoch_ns + int(d['t'] * 1e9), 1,
+                            d['cx'], d['cy'], d['w']])
+        with open(cpath, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['t_ns', 'a_v', 'a_h', 'v_fwd'])
+            for c in cmds_mem:
+                w.writerow([epoch_ns + int(c['t'] * 1e9),
+                            c['a_v'], c['a_h'], c['v_fwd']])
+        dets = load_detections(dpath)
+        cmds = load_commands(cpath)
     good = validate(dets, cmds, t_true, 1.5, 1.5)
     bad = validate(dets, cmds, 3.0 * t_true, 1.5, 1.5)
     m_good = float(np.median(good['errors_px']))
+    w_good = float(np.median(good['width_errors_px']))
     m_bad = float(np.median(bad['errors_px']))
-    ok = m_good <= tolerance_px and m_bad > 1.5 * m_good
-    print(f'[self-test] {len(dets)} detections / {len(cmds)} commands; '
-          f'median @true T_lag {m_good:.2f} px (tol {tolerance_px}), '
-          f'@3x T_lag {m_bad:.2f} px -> '
+    w_bad = float(np.median(bad['width_errors_px']))
+    ok = (m_good <= tolerance_px and w_good <= tolerance_px
+          and (m_bad > 1.5 * m_good or w_bad > 1.5 * w_good))
+    print(f'[self-test] {len(dets)} detections / {len(cmds)} commands '
+          f'(via CSV loaders); @true T_lag centre {m_good:.2f} px, width '
+          f'{w_good:.2f} px (tol {tolerance_px}); @3x T_lag centre '
+          f'{m_bad:.2f} px, width {w_bad:.2f} px -> '
           f'{"PASS" if ok else "FAIL"} (gate separates good from bad '
           f'dynamics)')
     return 0 if ok else 1

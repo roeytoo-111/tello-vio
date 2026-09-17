@@ -44,7 +44,12 @@ RANGES_M = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 AZIMUTHS_DEG = [-20, -12, -5, 0, 5, 12, 20]
 ELEVATIONS_DEG = [-12, -6, 0, 6, 12]
 TARGET_YAWS_DEG = [0, 45, 90, 180]
-LIGHTING = ['low', 'medium', 'high']   # mirror the paper's brightness study
+# Lighting is scene-side state the CLIENT CANNOT SET through either
+# engine's stock API: the operator configures the environment (sun angle /
+# intensity per the paper's low/medium/high study) and passes the matching
+# label per invocation -- one dataset run per lighting class. A fake
+# in-process lighting loop would stamp three labels onto identical frames.
+LIGHTING_CLASSES = ('low', 'medium', 'high')
 
 
 def yolo_line(b: BBox, img_w: int, img_h: int) -> str:
@@ -68,7 +73,7 @@ def pose_grid():
 
 
 def run(engine_name: str, out_dir: str, target_object: str,
-        lighting_cmd: str) -> int:
+        lighting: str) -> int:
     import cv2
     os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'labels'), exist_ok=True)
@@ -81,33 +86,30 @@ def run(engine_name: str, out_dir: str, target_object: str,
             meta = csv.writer(mf)
             meta.writerow(['stem', 'range_m', 'azimuth_deg', 'elevation_deg',
                            'target_yaw_deg', 'lighting', 'w_px', 'h_px'])
-            for light in LIGHTING:
-                # Lighting control is scene-specific: a console command /
-                # sun intensity per engine, configured by the operator;
-                # recorded in metadata either way.
-                for r, az, el, tyaw, ned in pose_grid():
-                    eng.set_object_pose(target_object, ned,
-                                        math.radians(tyaw))
-                    img = eng.get_rgb()
-                    boxes = eng.get_bboxes()
-                    if not boxes:
-                        continue                     # occluded / out of FOV
-                    b = boxes[0]
-                    stem = (f'{light}_r{r:0.2f}_az{az}_el{el}_y{tyaw}'
-                            .replace('.', 'p').replace('-', 'm'))
-                    cv2.imwrite(os.path.join(out_dir, 'images', stem + '.png'),
-                                img)
-                    with open(os.path.join(out_dir, 'labels', stem + '.txt'),
-                              'w') as lf:
-                        lf.write(yolo_line(b, img.shape[1], img.shape[0])
-                                 + '\n')
-                    meta.writerow([stem, r, az, el, tyaw, light,
-                                   f'{b.w:.1f}', f'{b.h:.1f}'])
-                    n += 1
+            for r, az, el, tyaw, ned in pose_grid():
+                eng.set_object_pose(target_object, ned,
+                                    math.radians(tyaw))
+                img = eng.get_rgb()
+                boxes = eng.get_bboxes()
+                if not boxes:
+                    continue                     # occluded / out of FOV
+                b = boxes[0]
+                stem = (f'{lighting}_r{r:0.2f}_az{az}_el{el}_y{tyaw}'
+                        .replace('.', 'p').replace('-', 'm'))
+                cv2.imwrite(os.path.join(out_dir, 'images', stem + '.png'),
+                            img)
+                with open(os.path.join(out_dir, 'labels', stem + '.txt'),
+                          'w') as lf:
+                    lf.write(yolo_line(b, img.shape[1], img.shape[0])
+                             + '\n')
+                meta.writerow([stem, r, az, el, tyaw, lighting,
+                               f'{b.w:.1f}', f'{b.h:.1f}'])
+                n += 1
     finally:
         eng.disconnect()
-    print(f'dataset: {n} labelled frames -> {out_dir} '
-          f'(mix with real captures before training!)')
+    print(f'dataset: {n} labelled frames at lighting={lighting} -> '
+          f'{out_dir} (set the scene lighting and rerun per class; mix '
+          f'with real captures before training!)')
     return 0
 
 
@@ -124,11 +126,11 @@ def dry_run() -> int:
     assert abs(parts[0] - (529.5 / FRAME_W)) < 1e-6
     assert abs(parts[2] - (59.0 / FRAME_W)) < 1e-6
     assert bbox_from_mask(np.zeros((4, 4), dtype=bool)) is None
-    grid = sum(1 for _ in pose_grid()) * len(LIGHTING)
-    print(f'[dry-run] label arithmetic OK; grid = {grid} captures '
-          f'({len(RANGES_M)} ranges x {len(AZIMUTHS_DEG)} az x '
-          f'{len(ELEVATIONS_DEG)} el x {len(TARGET_YAWS_DEG)} yaws x '
-          f'{len(LIGHTING)} lighting)')
+    grid = sum(1 for _ in pose_grid())
+    print(f'[dry-run] label arithmetic OK; grid = {grid} captures per '
+          f'lighting class ({len(RANGES_M)} ranges x {len(AZIMUTHS_DEG)} '
+          f'az x {len(ELEVATIONS_DEG)} el x {len(TARGET_YAWS_DEG)} yaws; '
+          f'x {len(LIGHTING_CLASSES)} operator-set lighting classes)')
     return 0
 
 
@@ -138,13 +140,15 @@ def main(argv=None):
                     choices=['projectairsim', 'classic'])
     ap.add_argument('--out', default='chase_dataset')
     ap.add_argument('--target-object', default='TargetTello')
-    ap.add_argument('--lighting-cmd', default='',
-                    help='engine-side lighting hook, operator-provided')
+    ap.add_argument('--lighting', default='medium',
+                    choices=LIGHTING_CLASSES,
+                    help='label for THIS run; set the scene lighting in '
+                         'the engine first, then run once per class')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
     if args.dry_run:
         return dry_run()
-    return run(args.engine, args.out, args.target_object, args.lighting_cmd)
+    return run(args.engine, args.out, args.target_object, args.lighting)
 
 
 if __name__ == '__main__':

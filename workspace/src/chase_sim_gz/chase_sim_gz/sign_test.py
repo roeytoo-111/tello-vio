@@ -67,10 +67,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     backend = make_backend(args)
-    backend.start()
-
     checks = []
     try:
+        backend.start()
         # +yaw -> image right (+u)
         settle(backend)
         b0, b1 = run_axis(backend, (0.0, 0.0, 0.0), +0.5)

@@ -47,7 +47,8 @@ def library_versions() -> dict:
 
 def save_bundle(path: str, *, trainer, noise, cfg, obs_spec, action_map: dict,
                 env_config: dict, env_step: int, eval_snapshot: dict,
-                curriculum_stage: int = 0, run_rng=None) -> str:
+                curriculum_stage: int = 0, run_rng=None,
+                env_rng_state=None) -> str:
     bundle = {
         'format_version': 1,
         'arm': cfg.arm,
@@ -75,6 +76,14 @@ def save_bundle(path: str, *, trainer, noise, cfg, obs_spec, action_map: dict,
             # state a resume must restore to truly continue the stream.
             'numpy_generator': (run_rng.bit_generator.state
                                 if run_rng is not None else None),
+            # The training env's own Generator (episode draws): restoring
+            # it is what makes a resume a continuation of the episode
+            # stream rather than a replay from the seed.
+            'env_generator': env_rng_state,
+            # torch.get_rng_state() is the CPU generator only; the TD3
+            # target-smoothing noise runs on the training device.
+            'torch_cuda': (torch.cuda.get_rng_state_all()
+                           if torch.cuda.is_available() else None),
         },
         'saved_at': time.strftime('%Y-%m-%dT%H:%M:%S'),
     }

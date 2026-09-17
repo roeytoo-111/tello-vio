@@ -86,7 +86,9 @@ def run_episode(env, policy, seed: int,
     lost = False
     captured = False
     while True:
-        a = np.asarray(get(obs), dtype=np.float32)
+        # reshape(-1): a batched (1,2) action would otherwise broadcast
+        # both components into histogram row 0.
+        a = np.asarray(get(obs), dtype=np.float32).reshape(-1)
         if action_hist is not None:
             n_dims = min(len(a), action_hist.shape[0])
             b = np.clip(np.digitize(a[:n_dims], action_bins) - 1, 0,

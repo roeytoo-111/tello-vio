@@ -43,10 +43,14 @@ from chase_eval.evaluate import ActorPolicy
 DT = C.DT
 
 
-def load_policy(checkpoint: str, spec: ObservationSpec) -> ActorPolicy:
+def load_policy(checkpoint: str, spec: ObservationSpec):
+    """Returns (policy, env_cfg): the actor AND the EnvConfig it trained
+    under -- v_max/omega_max/standoff/intercept params must be the trained
+    ones, and the obs-spec hash cannot police those."""
     from chase_train.checkpoint import actor_from_bundle, load_bundle
     bundle = load_bundle(checkpoint, expect_obs_spec=spec)
-    return ActorPolicy(actor_from_bundle(bundle))
+    env_cfg = EnvConfig(**bundle['config']['env'])
+    return ActorPolicy(actor_from_bundle(bundle)), env_cfg
 
 
 def detect(yolo, frame: np.ndarray):
@@ -115,7 +119,8 @@ def main(argv=None):
     ap.add_argument('--baseline', choices=['p_controller', 'pn'])
     ap.add_argument('--yolo', required=True, help='ultralytics weights')
     ap.add_argument('--task', default='follow',
-                    choices=['follow', 'intercept'])
+                    choices=['follow', 'intercept'],
+                    help='baselines only; a checkpoint brings its own task')
     ap.add_argument('--episodes', type=int, default=10)
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--out', default='vision_in_loop_result.json')
@@ -125,12 +130,16 @@ def main(argv=None):
 
     from ultralytics import YOLO
     yolo = YOLO(args.yolo)
-    cfg = EnvConfig(task=args.task)
     spec = ObservationSpec()
     if args.checkpoint:
-        policy = load_policy(args.checkpoint, spec)
+        policy, cfg = load_policy(args.checkpoint, spec)
+        if args.task and args.task != cfg.task:
+            raise SystemExit(
+                f'checkpoint was trained for task={cfg.task!r}; evaluate '
+                f'it there (got --task {args.task})')
         label = os.path.basename(args.checkpoint)
     else:
+        cfg = EnvConfig(task=args.task)
         policy = (PController(spec) if args.baseline == 'p_controller'
                   else PNController(spec))
         label = args.baseline

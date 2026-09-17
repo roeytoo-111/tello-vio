@@ -32,5 +32,6 @@ train:
 eval:
   every: 5000
   episodes_per_scenario: 10
+  plateau_enabled: false   # fit(nb_steps=100000) had no eval stopping [C]
 curriculum:
   enabled: false

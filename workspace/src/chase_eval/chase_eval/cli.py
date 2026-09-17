@@ -64,8 +64,10 @@ def main(argv=None):
         load_bundle(args.checkpoint, expect_obs_spec=probe.obs_spec)
         policy = ActorPolicy(actor_from_bundle(bundle))
         label = os.path.basename(args.checkpoint)
-        out_path = args.out or args.checkpoint.replace(
-            '.pt', '_eval_result.json')
+        # splitext, never substring-replace: a path without '.pt' must not
+        # map onto itself (that would overwrite the bundle with JSON).
+        out_path = args.out or (
+            os.path.splitext(args.checkpoint)[0] + '_eval_result.json')
     else:
         env_kwargs = {'task': args.task or 'follow', 'scenario': 'mix'}
         probe = ChaseEnv(EnvConfig(**env_kwargs))

@@ -65,10 +65,9 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     backend = make_backend(args)
-    backend.start()
-
     results = {}
     try:
+        backend.start()
         for axis, (lin, yaw) in AXES.items():
             backend.reset_world()
             backend.set_pose('follower', (0.0, 0.0, 1.5), 0.0)

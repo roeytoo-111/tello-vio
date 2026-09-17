@@ -37,6 +37,9 @@ def main(argv=None):
                     help='Tier-A bundle to continue from')
     add_backend_args(ap)
     ap.add_argument('--steps', type=int, default=10_000)
+    ap.add_argument('--device', default=None,
+                    help="cpu|cuda; default: the bundle config's device "
+                         "('auto' -> cuda if available)")
     ap.add_argument('--sigma', type=float, default=0.05,
                     help='exploration noise for the fine-tune (small: the '
                          'policy is already trained)')
@@ -48,7 +51,9 @@ def main(argv=None):
     if bundle['obs_spec']['mode'] != 'latency_aware':
         raise SystemExit('fine-tune needs a latency-aware Tier-A bundle')
     rng = seed_everything(cfg.seed)
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = args.device or cfg.device
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     env_cfg = EnvConfig(**cfg.env)
     env = GzChaseEnv(make_backend(args), env_cfg)
@@ -67,10 +72,12 @@ def main(argv=None):
     os.makedirs(run_dir, exist_ok=True)
     metrics_path = os.path.join(run_dir, 'metrics.jsonl')
 
-    obs, _ = env.reset(seed=cfg.seed)
     ep_returns, ep_ret, tv_steps, steps_total = [], 0.0, 0, 0
     t0 = time.time()
     try:
+        # Inside the try: the first reset runs the crash-prone gz server
+        # bring-up, and the server must be torn down on any failure.
+        obs, _ = env.reset(seed=cfg.seed)
         for step in range(1, args.steps + 1):
             mu = trainer.act(np.asarray(obs, dtype=np.float32))
             a = np.clip(mu + noise.sample(rng), -1.0, 1.0).astype(np.float32)
@@ -107,7 +114,9 @@ def main(argv=None):
                 obs_spec=env.obs_spec, action_map=bundle['action_map'],
                 env_config=dict(bundle['env_config'], tier='B'),
                 env_step=bundle['env_step'] + args.steps,
-                eval_snapshot={'time_in_view': tv_steps / max(steps_total, 1)})
+                eval_snapshot={'time_in_view': tv_steps / max(steps_total, 1)},
+                run_rng=rng,
+                env_rng_state=env.unwrapped.np_random.bit_generator.state)
     print(f'[done] fine-tuned bundle: {out}')
     return 0
 

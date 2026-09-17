@@ -70,8 +70,15 @@ def main(argv=None):
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, 'sb3_result.json'), 'w') as f:
         json.dump({'suite': suite, 'wall_s': wall,
-                   'config': cfg.to_dict(), 'sb3_sigma': sigma_mid}, f,
-                  indent=2)
+                   'config': cfg.to_dict(), 'sb3_sigma': sigma_mid,
+                   'config_differences': [
+                       f'constant NormalActionNoise sigma={sigma_mid} '
+                       f'(SB3 has no decay schedule; ours decays '
+                       f'{n.sigma0}->{n.sigma_min})',
+                       'single learning_rate for actor+critic (SB3 API)',
+                       'no demonstration prefill', 'no curriculum',
+                       'SB3 default final-layer init (not +/-3e-3)',
+                   ]}, f, indent=2)
     agg = suite['aggregate']
     print(f"[sb3-check] steps {cfg.train.total_steps}  "
           f"ret {agg['return_mean']:.2f}  tv {agg['time_in_view']:.2%}  "
