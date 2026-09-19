@@ -30,6 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import BBox, bbox_from_mask, make_engine  # noqa: E402
+import warehouse  # noqa: E402
 
 # The real camera's geometry comes from the shared constants (the repo's
 # chase_gym must be on PYTHONPATH, as for vision_in_loop_eval.py) -- never
@@ -81,7 +82,7 @@ def pose_grid(origin=FOLLOWER_NED, yaw: float = 0.0):
 
 
 def run(engine_name: str, out_dir: str, target_object: str,
-        lighting: str, address: str = None) -> int:
+        lighting: str, address: str = None, warehouse_scene: bool = True) -> int:
     import cv2
     os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'labels'), exist_ok=True)
@@ -94,6 +95,17 @@ def run(engine_name: str, out_dir: str, target_object: str,
     eng = make_engine(engine_name,
                       **({'address': address} if address else {}))
     eng.connect()
+    if warehouse_scene:
+        # Build the warehouse and set the interior light from the lighting
+        # class -- so --lighting physically changes the scene, and each class
+        # also gets its own clutter arrangement.
+        seed = {'low': 10, 'medium': 20, 'high': 30}.get(lighting, 0)
+        n_props, n_lights = warehouse.build_and_light(eng, seed=seed,
+                                                      lighting=lighting)
+        print(f'warehouse: {n_props} props, {n_lights} lights, '
+              f'lighting={lighting}')
+    eng.takeoff()                                # so the camera is at flight pose
+    eng.move_by_velocity_body(0.0, 0.0, -0.1, 0.0, 0.4)  # unpark/settle
     origin, yaw = eng.get_vehicle_pose()         # grid centred on the camera
     n = 0
     try:
@@ -165,6 +177,9 @@ def main(argv=None):
                          'wrong labels')
     ap.add_argument('--address', default=None,
                     help='engine host (default: the local machine)')
+    ap.add_argument('--no-warehouse', action='store_true',
+                    help='use the packaged outdoor level instead of building '
+                         'the indoor warehouse scene')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
     if args.dry_run:
@@ -173,7 +188,7 @@ def main(argv=None):
         ap.error('--lighting is required for a real run (the attestation '
                  'of the scene lighting you set in the engine)')
     return run(args.engine, args.out, args.target_object, args.lighting,
-               args.address)
+               args.address, warehouse_scene=not args.no_warehouse)
 
 
 if __name__ == '__main__':

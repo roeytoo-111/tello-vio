@@ -30,6 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import make_engine  # noqa: E402
+import warehouse  # noqa: E402
 
 # chase_gym/chase_train come from the repo workspace (PYTHONPATH); the
 # imports are the one-contract property, not a convenience.
@@ -130,6 +131,12 @@ def main(argv=None):
                          'brings its own task')
     ap.add_argument('--address', default=None,
                     help='engine host (default: the local machine)')
+    ap.add_argument('--no-warehouse', action='store_true',
+                    help='use the packaged outdoor level instead of the '
+                         'indoor warehouse scene')
+    ap.add_argument('--lighting', default='medium',
+                    choices=['low', 'medium', 'high'],
+                    help='warehouse interior light level')
     ap.add_argument('--episodes', type=int, default=10)
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--out', default='vision_in_loop_result.json')
@@ -156,6 +163,11 @@ def main(argv=None):
     eng = make_engine(args.engine,
                       **({'address': args.address} if args.address else {}))
     eng.connect()
+    if not args.no_warehouse:
+        n_props, n_lights = warehouse.build_and_light(eng, seed=20,
+                                                      lighting=args.lighting)
+        print(f'warehouse: {n_props} props, {n_lights} lights, '
+              f'lighting={args.lighting}')
     eng.takeoff()                    # velocity commands need flight mode
     episodes = []
     try:

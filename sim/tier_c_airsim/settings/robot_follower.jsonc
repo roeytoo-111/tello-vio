@@ -334,8 +334,10 @@
         "object-ids": ["TargetTello"],
         "bbox2D-settings": { "alignment": "axis" }
       },
+      // Mounted at the nose, ahead of the front rotors (x=0.253) so the
+      // camera does not see the follower's own propellers.
       "origin": {
-        "xyz": "0 0 0",
+        "xyz": "0.35 0 -0.05",
         "rpy-deg": "0 0 0"
       }
     },
