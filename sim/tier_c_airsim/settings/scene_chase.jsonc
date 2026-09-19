@@ -1,8 +1,7 @@
-// Project AirSim scene config for Tier C (verified key names from
-// iamaisim/ProjectAirSim docs/config_scene.md, 2026-09-17). Place the
-// packaged environment's own env actors as needed; this file declares the
-// follower drone and the target as an env actor whose mesh is a
-// Tello-scale model.
+// Project AirSim scene for Tier C. The follower is a full robot (robot_follower.jsonc).
+// The target is not declared here: engine.py spawns it at runtime as a static,
+// scaled mesh named "TargetTello", so it stays exactly where it is teleported
+// (environment actors re-apply their own trajectory pose on every tick).
 {
   "id": "SceneChase",
   "actors": [
@@ -11,16 +10,15 @@
       "name": "Follower",
       "origin": { "xyz": "0 0 -1.0", "rpy-deg": "0 0 0" },
       "robot-config": "robot_follower.jsonc"
-    },
-    {
-      "type": "env_actor",
-      "name": "TargetTello",
-      "origin": { "xyz": "2.0 0 -1.0", "rpy-deg": "0 0 0" }
-      // mesh/scale come from the environment's asset registry; a
-      // 0.098 x 0.098 x 0.041 m drone mesh, per the real airframe.
     }
   ],
-  "clock": { "type": "steppable", "step-ns": 3000000 },
+  "clock": {
+    "type": "steppable",
+    "step-ns": 3000000,
+    "real-time-update-rate": 3000000,
+    "pause-on-start": false
+  },
+  "home-geo-point": { "latitude": 47.641468, "longitude": -122.140165, "altitude": 122.0 },
   "segmentation": {
     "initialize-ids": true,
     "ignore-existing": false,

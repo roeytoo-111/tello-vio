@@ -38,8 +38,12 @@ from chase_gym import constants as _C  # noqa: E402
 
 FRAME_W, FRAME_H = _C.FRAME_W, _C.FRAME_H
 
-# The follower hovers at the origin looking north (NED +x); the target is
-# placed on a polar grid in front of it.
+# The follower hovers at FOLLOWER_NED looking north (NED +x); the target
+# is placed on a polar grid CENTRED ON THE CAMERA. The grid must share the
+# camera's altitude: measured against the shipped scene, a grid around the
+# world origin put only 356 of 1120 poses in frame and none nearer than
+# 2 m, because the camera sits 1 m up.
+FOLLOWER_NED = (0.0, 0.0, -1.0)
 RANGES_M = [0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 AZIMUTHS_DEG = [-20, -12, -5, 0, 5, 12, 20]
 ELEVATIONS_DEG = [-12, -6, 0, 6, 12]
@@ -59,21 +63,25 @@ def yolo_line(b: BBox, img_w: int, img_h: int) -> str:
             f'{b.w / img_w:.6f} {b.h / img_h:.6f}')
 
 
-def pose_grid():
+def pose_grid(origin=FOLLOWER_NED, yaw: float = 0.0):
+    """Polar grid centred on the CAMERA (origin, yaw): azimuth is measured
+    from the camera axis, so the grid is valid wherever the vehicle
+    actually is -- run() reads the live pose rather than assuming the
+    spawn point."""
     for r in RANGES_M:
         for az in AZIMUTHS_DEG:
             for el in ELEVATIONS_DEG:
                 for tyaw in TARGET_YAWS_DEG:
-                    az_r, el_r = math.radians(az), math.radians(el)
-                    # NED from the follower at origin looking +north.
-                    x = r * math.cos(el_r) * math.cos(az_r)
-                    y = r * math.cos(el_r) * math.sin(az_r)
-                    z = -r * math.sin(el_r)          # NED z is DOWN
+                    az_r = math.radians(az) + yaw
+                    el_r = math.radians(el)
+                    x = origin[0] + r * math.cos(el_r) * math.cos(az_r)
+                    y = origin[1] + r * math.cos(el_r) * math.sin(az_r)
+                    z = origin[2] - r * math.sin(el_r)   # NED z is DOWN
                     yield r, az, el, tyaw, (x, y, z)
 
 
 def run(engine_name: str, out_dir: str, target_object: str,
-        lighting: str) -> int:
+        lighting: str, address: str = None) -> int:
     import cv2
     os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'labels'), exist_ok=True)
@@ -83,8 +91,10 @@ def run(engine_name: str, out_dir: str, target_object: str,
     # its images stay on disk.
     write_header = not (os.path.exists(meta_path)
                         and os.path.getsize(meta_path) > 0)
-    eng = make_engine(engine_name)
+    eng = make_engine(engine_name,
+                      **({'address': address} if address else {}))
     eng.connect()
+    origin, yaw = eng.get_vehicle_pose()         # grid centred on the camera
     n = 0
     try:
         with open(meta_path, 'a', newline='') as mf:
@@ -93,9 +103,9 @@ def run(engine_name: str, out_dir: str, target_object: str,
                 meta.writerow(['stem', 'range_m', 'azimuth_deg',
                                'elevation_deg', 'target_yaw_deg',
                                'lighting', 'w_px', 'h_px'])
-            for r, az, el, tyaw, ned in pose_grid():
+            for r, az, el, tyaw, ned in pose_grid(origin, yaw):
                 eng.set_object_pose(target_object, ned,
-                                    math.radians(tyaw))
+                                    yaw + math.radians(tyaw))
                 img = eng.get_rgb()
                 boxes = eng.get_bboxes()
                 if not boxes:
@@ -147,16 +157,23 @@ def main(argv=None):
                     choices=['projectairsim', 'classic'])
     ap.add_argument('--out', default='chase_dataset')
     ap.add_argument('--target-object', default='TargetTello')
-    ap.add_argument('--lighting', required=True,
+    ap.add_argument('--lighting', default=None,
                     choices=LIGHTING_CLASSES,
-                    help='REQUIRED attestation of the scene lighting you '
-                         'set in the engine for THIS run -- a default '
-                         'would turn forgetfulness into wrong labels')
+                    help='REQUIRED (except --dry-run): attestation of the '
+                         'scene lighting you set in the engine for THIS '
+                         'run -- a default would turn forgetfulness into '
+                         'wrong labels')
+    ap.add_argument('--address', default=None,
+                    help='engine host (default: the local machine)')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
     if args.dry_run:
         return dry_run()
-    return run(args.engine, args.out, args.target_object, args.lighting)
+    if args.lighting is None:
+        ap.error('--lighting is required for a real run (the attestation '
+                 'of the scene lighting you set in the engine)')
+    return run(args.engine, args.out, args.target_object, args.lighting,
+               args.address)
 
 
 if __name__ == '__main__':

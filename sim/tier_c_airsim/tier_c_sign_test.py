@@ -19,6 +19,7 @@ checkpoints -- never patch signs downstream.
 """
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -27,7 +28,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from engine import make_engine  # noqa: E402
 
 SETTLE_S = 1.0
-PUSH_S = 1.0
+PUSH_S = 1.6
+TICK_S = 0.2
+RANGE_M = 3.0
 
 
 def bbox_centre(eng):
@@ -39,18 +42,35 @@ def bbox_centre(eng):
     return ((b.xmin + b.xmax) / 2.0, (b.ymin + b.ymax) / 2.0, b.w)
 
 
+def fmt(b, i):
+    return f'{b[i]:.1f}' if b is not None else 'none'
+
+
 def settle(eng):
-    eng.set_vehicle_pose((0.0, 0.0, -1.0), 0.0)
-    eng.set_object_pose('TargetTello', (2.0, 0.0, -1.0), 0.0)
-    eng.hover()
+    """Re-centre the TARGET on the vehicle's current camera axis. The
+    vehicle is NEVER hovered or teleported here: a hover re-parks
+    simple_flight so the next yaw command is silently dropped (measured on
+    Blocks 1.0.1), and teleporting a flying physics vehicle does not stick.
+    The sign checks only need the relative geometry, so we place the target
+    on the live axis and let the vehicle keep flying."""
+    (x, y, z), yaw = eng.get_vehicle_pose()
+    eng.set_object_pose('TargetTello',
+                        (x + RANGE_M * math.cos(yaw),
+                         y + RANGE_M * math.sin(yaw), z), yaw)
     time.sleep(SETTLE_S)
 
 
 def push(eng, v_fwd=0.0, v_up=0.0, yaw_rate=0.0):
+    """Drive CONTINUOUSLY in short ticks, exactly as the vision-in-loop
+    eval does -- a single isolated command is unreliable for yaw on
+    simple_flight, but the continuous closed-loop pattern actuates it (a
+    P-controller centres a 0.35 rad off-axis target this way). No hover: it
+    would re-park the controller."""
     b0 = bbox_centre(eng)
-    eng.move_by_velocity_body(v_fwd, 0.0, -v_up, yaw_rate, PUSH_S)
+    n = max(1, int(round(PUSH_S / TICK_S)))
+    for _ in range(n):
+        eng.move_by_velocity_body(v_fwd, 0.0, -v_up, yaw_rate, TICK_S)
     b1 = bbox_centre(eng)
-    eng.hover()
     return b0, b1
 
 
@@ -58,28 +78,33 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--engine', default='projectairsim',
                     choices=['projectairsim', 'classic'])
+    ap.add_argument('--address', default=None,
+                    help='engine host (default: the local machine)')
     ap.add_argument('--out', default='tier_c_sign_test_result.json')
     args = ap.parse_args(argv)
 
-    eng = make_engine(args.engine)
+    eng = make_engine(args.engine,
+                      **({'address': args.address} if args.address else {}))
     eng.connect()
     checks = []
     try:
+        eng.takeoff()                # velocity commands need flight mode
+        eng.move_by_velocity_body(0.0, 0.0, -0.1, 0.0, 0.4)  # unpark (UP)
         settle(eng)
-        b0, b1 = push(eng, yaw_rate=+0.5)
+        b0, b1 = push(eng, v_up=0.15, yaw_rate=+0.3)
         ok = b0 is not None and b1 is not None and b1[0] > b0[0] + 5.0
         checks.append(('+yaw_rate (REP-103 CCW) -> +u (image right)', ok,
-                       f'u {b0 and b0[0]:.1f} -> {b1 and b1[0]:.1f}'))
+                       f'u {fmt(b0, 0)} -> {fmt(b1, 0)}'))
         settle(eng)
         b0, b1 = push(eng, v_up=+0.3)
         ok = b0 is not None and b1 is not None and b1[1] > b0[1] + 5.0
         checks.append(('+v_up -> +v (image down)', ok,
-                       f'v {b0 and b0[1]:.1f} -> {b1 and b1[1]:.1f}'))
+                       f'v {fmt(b0, 1)} -> {fmt(b1, 1)}'))
         settle(eng)
         b0, b1 = push(eng, v_fwd=+0.3)
         ok = b0 is not None and b1 is not None and b1[2] > b0[2] + 1.0
         checks.append(('+v_fwd -> bbox width grows', ok,
-                       f'w {b0 and b0[2]:.1f} -> {b1 and b1[2]:.1f}'))
+                       f'w {fmt(b0, 2)} -> {fmt(b1, 2)}'))
     finally:
         eng.disconnect()
 

@@ -33,6 +33,7 @@ Coordinates: positions stay NED (m); velocities m/s; yaw-rate inputs are
 REP-103 CCW-positive and converted here.
 """
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -64,6 +65,19 @@ class EngineBase:
 
     def connect(self) -> None: ...
     def disconnect(self) -> None: ...
+    def takeoff(self) -> None:
+        """Put the vehicle in flight. Velocity commands are only honoured
+        once the controller is flying (verified live: before takeoff a yaw
+        command did nothing and a climb crawled; after takeoff both track
+        their setpoints)."""
+        ...
+    def get_vehicle_pose(self):
+        """-> ((x, y, z) NED metres, yaw rad). Scripts place the TARGET
+        relative to this instead of teleporting the vehicle: teleporting a
+        flying physics vehicle does not stick (verified live -- commanded
+        (0,0,-1), the vehicle stayed near its altitude and only its yaw
+        reset)."""
+        ...
     def set_object_pose(self, name: str, ned_xyz, yaw_rad: float) -> None: ...
     def set_vehicle_pose(self, ned_xyz, yaw_rad: float) -> None: ...
     def get_rgb(self) -> np.ndarray: ...
@@ -87,27 +101,50 @@ class EngineBase:
 class ProjectAirSimEngine(EngineBase):
     """Project AirSim backend. Scene/robot JSONC configs live in
     settings/; the camera there is 960x720 FOV 55.1 deg [V ost.txt] with
-    annotation-settings enabled for the target object ids."""
+    annotation-settings enabled for the target object ids.
+
+    The target is SPAWNED at connect() rather than declared in the scene:
+    env actors re-apply their own trajectory pose on every engine tick
+    (upstream UnrealEnvActor::Tick), so a teleported env actor snaps back
+    one frame later, while a spawned static object stays put (verified
+    live on Blocks 1.0.1, 2026-09-19)."""
+
+    # 'Quadrotor1' spans 1.303 m at scale 1 (measured live via its bbox2d
+    # at a known range); 0.138 shrinks it to the Tello's 0.18 m prop span.
+    TARGET_ASSET = 'Quadrotor1'
+    TARGET_SCALE = 0.18 / 1.303
 
     def __init__(self, scene_config: str = 'scene_chase.jsonc',
-                 sim_config_path: str = 'settings',
+                 sim_config_path: str = None,
                  address: str = '127.0.0.1',
                  vehicle: str = 'Follower', camera: str = 'FrontCamera',
-                 target_ids: Tuple[str, ...] = ('TargetTello',)):
+                 target_ids: Tuple[str, ...] = ('TargetTello',),
+                 target_asset: str = None, target_scale: float = None):
         self.scene_config = scene_config
-        self.sim_config_path = sim_config_path
+        # Anchor to this file, not the CWD: World joins the two paths and
+        # opens the result relative to the process working directory.
+        self.sim_config_path = sim_config_path or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'settings')
         self.address = address
         self.vehicle = vehicle
         self.camera = camera
         self.target_ids = target_ids
+        self.target_asset = target_asset or self.TARGET_ASSET
+        self.target_scale = target_scale or self.TARGET_SCALE
         self._client = None
         self._world = None
         self._drone = None
+        self._loop = None
+        self._parked = True
 
     def connect(self) -> None:
         # Lazy import: this module must be importable (and dry-runnable)
         # on machines without any engine installed.
+        import asyncio
         from projectairsim import ProjectAirSimClient, World, Drone
+        # One private loop for the whole session: get_event_loop() outside
+        # a running loop is deprecated (an error from Python 3.14).
+        self._loop = asyncio.new_event_loop()
         self._client = ProjectAirSimClient(address=self.address)
         self._client.connect()
         self._world = World(self._client, self.scene_config,
@@ -116,11 +153,73 @@ class ProjectAirSimEngine(EngineBase):
         self._drone = Drone(self._client, self._world, self.vehicle)
         self._drone.enable_api_control()
         self._drone.arm()
+        # Static (physics-off) target; annotations are configured for this
+        # exact name, and spawn_object may rename on collision -- refuse
+        # rather than label a target the camera is not annotating.
+        name = self._world.spawn_object(
+            self.target_ids[0], self.target_asset,
+            self._pose((2.0, 0.0, -1.0), 0.0),
+            [self.target_scale] * 3, False)
+        if name != self.target_ids[0]:
+            raise RuntimeError(
+                f'target spawned as {name!r}, not {self.target_ids[0]!r} '
+                f'(name taken in the scene?) -- bbox annotations would '
+                f'silently miss it')
+
+    def takeoff(self) -> None:
+        self._run(self._drone.takeoff_async())
+        self._parked = True
+
+    # Measured on Blocks 1.0.1 (2026-09-19): from a parked state (just
+    # after takeoff or a hover), a yaw-ONLY command -- move_by_velocity or
+    # rotate_by_yaw_rate -- is silently ignored (heading moved 0.0000 rad).
+    # A command carrying any nonzero linear velocity unparks the controller
+    # so the NEXT yaw takes effect. An UPWARD wake works (verified at
+    # -0.3/-0.1/-0.05 and a lateral variant -> subsequent yaw moved
+    # -0.14..-0.20 rad); a downward pulse is itself ignored and does not
+    # unpark. Trap 5 of this adapter: before a yaw-only command from the
+    # parked state, send a brief upward wake (few cm) so the yaw takes
+    # effect. It fires only from the parked state, so a continuously-
+    # commanding controller pays it at most once per hover.
+    _WAKE_V = -0.1        # NED z-up (negative), verified to unpark
+    _WAKE_S = 0.3
+
+    def _wake_if_parked(self, vx, vy, vz, yaw_rate) -> None:
+        lin = abs(vx) + abs(vy) + abs(vz)
+        if lin > 1e-6:
+            self._parked = False
+            return
+        if yaw_rate != 0.0 and self._parked:
+            from projectairsim.drone import YawControlMode
+            self._run(self._drone.move_by_velocity_async(
+                0.0, 0.0, self._WAKE_V, self._WAKE_S,
+                yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
+                yaw_is_rate=True, yaw=0.0))
+            self._parked = False
+
+    def get_vehicle_pose(self):
+        k = self._drone.get_ground_truth_kinematics()
+        p, q = k['pose']['position'], k['pose']['orientation']
+        yaw = math.atan2(2.0 * (q['w'] * q['z'] + q['x'] * q['y']),
+                         1.0 - 2.0 * (q['y'] ** 2 + q['z'] ** 2))
+        return (p['x'], p['y'], p['z']), yaw
+
+    def _run(self, coro):
+        """Drive an SDK command to COMPLETION. The async APIs are
+        two-stage: awaiting the coroutine only SENDS the request and
+        returns the motion's own asyncio.Task, which must be awaited too
+        (upstream hello_drone.py awaits twice). One await returns before
+        the vehicle has moved."""
+        task = self._loop.run_until_complete(coro)
+        return self._loop.run_until_complete(task)
 
     def disconnect(self) -> None:
         if self._client is not None:
             self._client.disconnect()
             self._client = None
+        if self._loop is not None:
+            self._loop.close()
+            self._loop = None
 
     @staticmethod
     def _pose(ned_xyz, yaw_rad: float) -> dict:
@@ -139,6 +238,8 @@ class ProjectAirSimEngine(EngineBase):
                              reset_kinematics=True)
 
     def get_rgb(self) -> np.ndarray:
+        # NOTE: despite the name, bytes are BGR (server packs B,G,R) --
+        # which is exactly what cv2.imwrite and ultralytics expect.
         from projectairsim.types import ImageType
         from projectairsim.utils import unpack_image
         images = self._drone.get_images(self.camera, [ImageType.SCENE])
@@ -172,27 +273,35 @@ class ProjectAirSimEngine(EngineBase):
 
     def move_by_velocity(self, v_north, v_east, v_down, yaw_rate_rad_s,
                          duration_s) -> None:
-        import asyncio
         from projectairsim.drone import YawControlMode
+        self._wake_if_parked(v_north, v_east, v_down, yaw_rate_rad_s)
         # Project AirSim yaw is rad/s [V drone.py docstring].
-        task = self._drone.move_by_velocity_async(
+        self._run(self._drone.move_by_velocity_async(
             float(v_north), float(v_east), float(v_down), float(duration_s),
             yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
-            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s))
-        asyncio.get_event_loop().run_until_complete(task)
+            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s)))
 
     def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
                               duration_s) -> None:
-        import asyncio
-        from projectairsim.drone import YawControlMode
-        task = self._drone.move_by_velocity_body_frame_async(
-            float(v_fwd), float(v_right), float(v_down), float(duration_s),
-            yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
-            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s))
-        asyncio.get_event_loop().run_until_complete(task)
+        # Route body-frame commands through the WORLD API. Measured on
+        # Blocks 1.0.1 (2026-09-19): move_by_velocity_body_frame_async does
+        # NOT actuate yaw at all (5/5 reps of a 2 s body yaw moved the
+        # heading 0.0000 rad), while the world move_by_velocity yaw does.
+        # Rotating the body velocity into world with the live heading, then
+        # calling move_by_velocity, gives working yaw AND keeps the linear
+        # command carrying motion (so a chase command self-unparks). The
+        # heading drifts within the command window, but a 10 Hz caller
+        # re-reads and re-converts every tick.
+        (_, _, _), yaw = self.get_vehicle_pose()
+        c, s = math.cos(yaw), math.sin(yaw)
+        v_north = v_fwd * c - v_right * s
+        v_east = v_fwd * s + v_right * c
+        self.move_by_velocity(v_north, v_east, v_down, yaw_rate_rad_s,
+                              duration_s)
 
     def hover(self) -> None:
         self.move_by_velocity(0.0, 0.0, 0.0, 0.0, 0.1)
+        self._parked = True
 
 
 class ClassicEngine(EngineBase):
@@ -204,7 +313,8 @@ class ClassicEngine(EngineBase):
 
     def __init__(self, camera: str = '0', vehicle: str = '',
                  target_mesh_regex: str = 'TargetTello*',
-                 detection_radius_cm: float = 2000_00):
+                 detection_radius_cm: float = 2000_00,
+                 address: str = ''):
         # NOTE: simAddDetectionFilterMeshName takes a UE WILDCARD pattern
         # ('*' globs, '.' is literal), not a regex -- and the default must
         # match the default target object name used across Tier C.
@@ -212,6 +322,7 @@ class ClassicEngine(EngineBase):
         self.vehicle = vehicle
         self.target_mesh_regex = target_mesh_regex
         self.detection_radius_cm = detection_radius_cm
+        self.address = address                 # '' = 127.0.0.1
         self._client = None
 
     def connect(self) -> None:
@@ -220,7 +331,12 @@ class ClassicEngine(EngineBase):
         except ImportError:
             import airsim                     # Colosseum / classic
         self._airsim = airsim
-        self._client = airsim.MultirotorClient()
+        # Cosys-AirSim diverges from classic in two silent ways handled
+        # below: euler_to_quaternion(roll,pitch,yaw) instead of
+        # to_quaternion(pitch,roll,yaw), and RGB image bytes instead of
+        # classic's BGR.
+        self._is_cosys = 'cosys' in airsim.__name__
+        self._client = airsim.MultirotorClient(ip=self.address)
         self._client.confirmConnection()
         self._client.enableApiControl(True, self.vehicle)
         self._client.armDisarm(True, self.vehicle)
@@ -238,18 +354,32 @@ class ClassicEngine(EngineBase):
             self._client.enableApiControl(False, self.vehicle)
             self._client = None
 
-    def set_object_pose(self, name: str, ned_xyz, yaw_rad: float) -> None:
+    def _yaw_pose(self, ned_xyz, yaw_rad: float):
         a = self._airsim
-        pose = a.Pose(a.Vector3r(*map(float, ned_xyz)),
-                      a.to_quaternion(0.0, 0.0, float(yaw_rad)))
-        self._client.simSetObjectPose(name, pose, teleport=True)
+        if hasattr(a, 'to_quaternion'):        # classic / Colosseum
+            q = a.to_quaternion(0.0, 0.0, float(yaw_rad))
+        else:                                  # Cosys 3.5: no to_quaternion
+            q = a.utils.euler_to_quaternion(0.0, 0.0, float(yaw_rad))
+        return a.Pose(a.Vector3r(*map(float, ned_xyz)), q)
+
+    def set_object_pose(self, name: str, ned_xyz, yaw_rad: float) -> None:
+        self._client.simSetObjectPose(name, self._yaw_pose(ned_xyz, yaw_rad),
+                                      teleport=True)
 
     def set_vehicle_pose(self, ned_xyz, yaw_rad: float) -> None:
-        a = self._airsim
-        pose = a.Pose(a.Vector3r(*map(float, ned_xyz)),
-                      a.to_quaternion(0.0, 0.0, float(yaw_rad)))
-        self._client.simSetVehiclePose(pose, ignore_collision=True,
+        self._client.simSetVehiclePose(self._yaw_pose(ned_xyz, yaw_rad),
+                                       ignore_collision=True,
                                        vehicle_name=self.vehicle)
+
+    def takeoff(self) -> None:
+        self._client.takeoffAsync(vehicle_name=self.vehicle).join()
+
+    def get_vehicle_pose(self):
+        pose = self._client.simGetVehiclePose(vehicle_name=self.vehicle)
+        p, q = pose.position, pose.orientation
+        yaw = math.atan2(2.0 * (q.w_val * q.z_val + q.x_val * q.y_val),
+                         1.0 - 2.0 * (q.y_val ** 2 + q.z_val ** 2))
+        return (p.x_val, p.y_val, p.z_val), yaw
 
     def get_rgb(self) -> np.ndarray:
         a = self._airsim
@@ -257,7 +387,10 @@ class ClassicEngine(EngineBase):
             [a.ImageRequest(self.camera, a.ImageType.Scene, False, False)],
             vehicle_name=self.vehicle)[0]
         img = np.frombuffer(resp.image_data_uint8, dtype=np.uint8)
-        return img.reshape(resp.height, resp.width, 3)
+        img = img.reshape(resp.height, resp.width, 3)
+        # Contract: BGR out (cv2/ultralytics convention). Classic and
+        # Colosseum pack B,G,R; Cosys packs R,G,B and must be flipped.
+        return img[:, :, ::-1] if self._is_cosys else img
 
     def get_bboxes(self) -> List[BBox]:
         dets = self._client.simGetDetections(

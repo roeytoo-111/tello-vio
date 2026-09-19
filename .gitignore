@@ -52,3 +52,6 @@ chase_dataset/
 # Detector weights and training-run outputs (checkpoints, metrics, ONNX)
 yolov8n.pt
 runs/
+
+# Project AirSim client writes this next to the CWD
+projectairsim_client.log

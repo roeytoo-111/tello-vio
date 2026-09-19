@@ -78,10 +78,16 @@ def run_episode(eng, yolo, policy, cfg: EnvConfig, spec: ObservationSpec,
     asm = ObservationAssembler(spec)
     if hasattr(policy, 'reset'):
         policy.reset()             # baselines carry filter/LOS state
-    # Reset geometry: follower at origin looking north, target ahead.
-    eng.set_vehicle_pose((0.0, 0.0, -1.0), 0.0)      # NED: z=-1 is 1 m up
+    # Reset geometry RELATIVE to the vehicle's live pose: the target goes
+    # r0 ahead along the current heading at the current altitude. The
+    # vehicle is never teleported -- that does not stick in flight -- so
+    # episodes start wherever the last one ended, with correct relative
+    # geometry.
+    (x, y, z), yaw = eng.get_vehicle_pose()
     r0 = rng.uniform(*cfg.resolved_reset_range())
-    eng.set_object_pose('TargetTello', (r0, 0.0, -1.0), 0.0)
+    eng.set_object_pose('TargetTello',
+                        (x + r0 * math.cos(yaw), y + r0 * math.sin(yaw), z),
+                        yaw)
     time.sleep(0.5)
 
     stats = {'steps': 0, 'detected': 0, 'captured': False}
@@ -122,6 +128,8 @@ def main(argv=None):
                     choices=['follow', 'intercept'],
                     help='baselines only (default follow); a checkpoint '
                          'brings its own task')
+    ap.add_argument('--address', default=None,
+                    help='engine host (default: the local machine)')
     ap.add_argument('--episodes', type=int, default=10)
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--out', default='vision_in_loop_result.json')
@@ -145,8 +153,10 @@ def main(argv=None):
                   else PNController(spec))
         label = args.baseline
 
-    eng = make_engine(args.engine)
+    eng = make_engine(args.engine,
+                      **({'address': args.address} if args.address else {}))
     eng.connect()
+    eng.takeoff()                    # velocity commands need flight mode
     episodes = []
     try:
         for e in range(args.episodes):
@@ -160,12 +170,15 @@ def main(argv=None):
         eng.disconnect()
 
     agg = {
-        'label': label, 'engine': args.engine, 'task': args.task,
+        'label': label, 'engine': args.engine, 'task': cfg.task,
         'episodes': episodes,
         'mean_detection_rate': float(np.mean(
             [e['detection_rate'] for e in episodes])),
+        # Keyed on the RESOLVED task (a checkpoint brings its own):
+        # args.task alone dropped the headline number for every intercept
+        # checkpoint evaluated without an explicit --task.
         'capture_rate': float(np.mean(
-            [e['captured'] for e in episodes])) if args.task == 'intercept'
+            [e['captured'] for e in episodes])) if cfg.task == 'intercept'
         else None,
     }
     with open(args.out, 'w') as f:
