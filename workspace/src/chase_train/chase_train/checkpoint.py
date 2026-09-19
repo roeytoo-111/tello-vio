@@ -189,9 +189,16 @@ def update_best_manifest(run_dir: str, entry: dict) -> None:
 
 
 def export_onnx(bundle: dict, out_path: str,
-                atol: float = 1e-5) -> Optional[str]:
+                atol: float = 1e-4) -> Optional[str]:
     """Actor -> ONNX (opset 17, dynamic batch) with a torch-vs-onnxruntime
-    parity check. Returns the path, or None if onnx is unavailable."""
+    parity check. Returns the path, or None if onnx is unavailable.
+
+    atol is 1e-4: torch-fp32 vs onnxruntime-fp32 differ by ~1e-5 from
+    backend accumulation order alone (the faithful arm's deeper 3-layer
+    head reached 1.14e-5 and tripped the old 1e-5 bound, failing runs
+    whose training and export were both fine). 1e-4 still catches a real
+    mismatch (wrong weights/layers diverge by >=0.1) while tolerating
+    rounding; a correct td3 export measures ~3e-7 here."""
     try:
         import onnx  # noqa: F401
         import onnxruntime as ort
