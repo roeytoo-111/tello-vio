@@ -55,3 +55,11 @@ runs/
 
 # Project AirSim client writes this next to the CWD
 projectairsim_client.log
+
+# Tier C detector + eval outputs (weights, debug frames, snapshots)
+detector_runs/
+chase_frames*/
+yolo_view/
+warehouse_view.png
+vision_in_loop_result.json
+yolo26*.pt

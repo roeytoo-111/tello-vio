@@ -29,6 +29,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import chase_paths  # noqa: F401,E402  (puts chase_* on sys.path)
 from engine import BBox, bbox_from_mask, make_engine  # noqa: E402
 import warehouse  # noqa: E402
 
@@ -56,6 +57,10 @@ TARGET_YAWS_DEG = [0, 45, 90, 180]
 # in-process lighting loop would stamp three labels onto identical frames.
 LIGHTING_CLASSES = ('low', 'medium', 'high')
 
+# Where the target goes while NEGATIVE frames are captured: under the
+# floor slab, so no view can contain it.
+NEG_HIDE_NED = (9.0, 0.0, 2.0)
+
 
 def yolo_line(b: BBox, img_w: int, img_h: int) -> str:
     cx = (b.xmin + b.xmax) / 2.0 / img_w
@@ -81,8 +86,66 @@ def pose_grid(origin=FOLLOWER_NED, yaw: float = 0.0):
                     yield r, az, el, tyaw, (x, y, z)
 
 
+def capture_negatives(eng, out_dir, meta, target_object, lighting,
+                      n_frames: int) -> int:
+    """BACKGROUND frames: the warehouse with NO drone anywhere in view,
+    saved with EMPTY label files (the ultralytics background convention).
+
+    Why: a detector trained only on frames that all contain the target
+    never learns what 'no drone' looks like -- measured live, ours
+    hallucinated 0.6-0.9-confidence boxes on dark walls/shelf shadows the
+    moment the intercept eval flew off the aisle axis, and every phantom
+    box became a fake width-based capture. Standard practice is ~10%
+    negatives.
+
+    The patrol deliberately produces the OFF-AXIS views that fooled it:
+    the target is hidden under the floor, then the vehicle spins in place
+    (with the slight vertical bias that makes simple_flight yaw actuate)
+    at several spots down the aisle, capturing walls, racks, dark corners
+    and the ceiling. Every frame is verified target-free via the engine's
+    own annotations before it is saved."""
+    import time
+    import cv2
+    eng.set_object_pose(target_object, NEG_HIDE_NED, 0.0)
+    time.sleep(0.5)
+    n = 0
+    spot = 0
+    v_up_sign = 1.0
+    while n < n_frames:
+        # a slow spin with a small alternating climb/descend bias (yaw
+        # only actuates alongside vertical motion on simple_flight)
+        for _ in range(max(6, n_frames // 4)):
+            if n >= n_frames:
+                break
+            eng.move_by_velocity_body(0.0, 0.0, -0.06 * v_up_sign, 0.55,
+                                      1.0, wait=False)
+            time.sleep(0.55)
+            img = eng.get_rgb()
+            if eng.get_bboxes():
+                continue                 # target somehow in view: not a negative
+            stem = f'{lighting}_neg_{n:03d}'
+            cv2.imwrite(os.path.join(out_dir, 'images', stem + '.png'), img)
+            open(os.path.join(out_dir, 'labels', stem + '.txt'), 'w').close()
+            meta.writerow([stem, 'neg', '', '', '', lighting, '', ''])
+            n += 1
+        v_up_sign = -v_up_sign
+        if hasattr(eng, 'settle'):
+            eng.settle()
+        # hop to the next spot down the aisle for fresh backgrounds
+        spot += 1
+        if spot < 3 and n < n_frames:
+            for _ in range(4):
+                eng.move_by_velocity_body(0.8, 0.0, 0.0, 0.0, 1.0,
+                                          wait=False)
+                time.sleep(0.5)
+            if hasattr(eng, 'settle'):
+                eng.settle()
+    return n
+
+
 def run(engine_name: str, out_dir: str, target_object: str,
-        lighting: str, address: str = None, warehouse_scene: bool = True) -> int:
+        lighting: str, address: str = None, warehouse_scene: bool = True,
+        negatives: int = 0, grid: bool = True) -> int:
     import cv2
     os.makedirs(os.path.join(out_dir, 'images'), exist_ok=True)
     os.makedirs(os.path.join(out_dir, 'labels'), exist_ok=True)
@@ -115,7 +178,8 @@ def run(engine_name: str, out_dir: str, target_object: str,
                 meta.writerow(['stem', 'range_m', 'azimuth_deg',
                                'elevation_deg', 'target_yaw_deg',
                                'lighting', 'w_px', 'h_px'])
-            for r, az, el, tyaw, ned in pose_grid(origin, yaw):
+            for r, az, el, tyaw, ned in (
+                    pose_grid(origin, yaw) if grid else ()):
                 eng.set_object_pose(target_object, ned,
                                     yaw + math.radians(tyaw))
                 img = eng.get_rgb()
@@ -134,6 +198,12 @@ def run(engine_name: str, out_dir: str, target_object: str,
                 meta.writerow([stem, r, az, el, tyaw, lighting,
                                f'{b.w:.1f}', f'{b.h:.1f}'])
                 n += 1
+            if negatives > 0:
+                n_neg = capture_negatives(eng, out_dir, meta,
+                                          target_object, lighting,
+                                          negatives)
+                print(f'negatives: {n_neg} background frames at '
+                      f'lighting={lighting}')
     finally:
         eng.disconnect()
     print(f'dataset: {n} labelled frames at lighting={lighting} -> '
@@ -180,6 +250,14 @@ def main(argv=None):
     ap.add_argument('--no-warehouse', action='store_true',
                     help='use the packaged outdoor level instead of building '
                          'the indoor warehouse scene')
+    ap.add_argument('--negatives', type=int, default=0,
+                    help='ALSO capture this many target-free background '
+                         'frames (empty labels) via a patrol -- a detector '
+                         'trained with zero negatives hallucinates drones '
+                         'on dark walls (measured)')
+    ap.add_argument('--negatives-only', action='store_true',
+                    help='skip the labelled pose grid; only patrol for '
+                         'background frames (append to an existing set)')
     ap.add_argument('--dry-run', action='store_true')
     args = ap.parse_args(argv)
     if args.dry_run:
@@ -187,8 +265,11 @@ def main(argv=None):
     if args.lighting is None:
         ap.error('--lighting is required for a real run (the attestation '
                  'of the scene lighting you set in the engine)')
+    if args.negatives_only and args.negatives <= 0:
+        ap.error('--negatives-only needs --negatives N')
     return run(args.engine, args.out, args.target_object, args.lighting,
-               args.address, warehouse_scene=not args.no_warehouse)
+               args.address, warehouse_scene=not args.no_warehouse,
+               negatives=args.negatives, grid=not args.negatives_only)
 
 
 if __name__ == '__main__':
