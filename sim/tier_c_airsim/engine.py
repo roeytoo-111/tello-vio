@@ -83,17 +83,21 @@ class EngineBase:
     def get_rgb(self) -> np.ndarray: ...
     def get_bboxes(self) -> List[BBox]: ...
     def move_by_velocity(self, v_north: float, v_east: float, v_down: float,
-                         yaw_rate_rad_s: float, duration_s: float) -> None:
+                         yaw_rate_rad_s: float, duration_s: float,
+                         wait: bool = True) -> None:
         """yaw_rate_rad_s is REP-103 CCW-positive (negated internally for
-        the NED engines)."""
+        the NED engines). wait=False SENDS the command and returns -- the
+        RC-stick semantics of the real Tello (the command persists until
+        the next one overrides it); wait=True blocks until the motion
+        window completes."""
         ...
     def move_by_velocity_body(self, v_fwd: float, v_right: float,
                               v_down: float, yaw_rate_rad_s: float,
-                              duration_s: float) -> None:
+                              duration_s: float, wait: bool = True) -> None:
         """Body-frame velocity + yaw rate -- the Tello stick semantics,
         yaw REP-103 CCW-positive. Preferred for closed-loop control: no
         client-side yaw dead-reckoning (which drifts against the engine's
-        true heading)."""
+        true heading). wait as in move_by_velocity."""
         ...
     def hover(self) -> None: ...
 
@@ -136,6 +140,7 @@ class ProjectAirSimEngine(EngineBase):
         self._drone = None
         self._loop = None
         self._parked = True
+        self._pending = None       # last fire-and-forget motion Task
 
     def connect(self) -> None:
         # Lazy import: this module must be importable (and dry-runnable)
@@ -214,6 +219,17 @@ class ProjectAirSimEngine(EngineBase):
         return self._loop.run_until_complete(task)
 
     def disconnect(self) -> None:
+        if self._pending is not None and self._loop is not None:
+            # Retire the last fire-and-forget Task before the sockets go
+            # away, or asyncio warns 'Task was destroyed but it is
+            # pending!' at interpreter exit.
+            import asyncio
+            self._pending.cancel()
+            try:
+                self._loop.run_until_complete(asyncio.sleep(0))
+            except Exception:
+                pass
+            self._pending = None
         if self._client is not None:
             self._client.disconnect()
             self._client = None
@@ -272,17 +288,28 @@ class ProjectAirSimEngine(EngineBase):
         return -float(rep103_rad_s)
 
     def move_by_velocity(self, v_north, v_east, v_down, yaw_rate_rad_s,
-                         duration_s) -> None:
+                         duration_s, wait: bool = True) -> None:
         from projectairsim.drone import YawControlMode
         self._wake_if_parked(v_north, v_east, v_down, yaw_rate_rad_s)
         # Project AirSim yaw is rad/s [V drone.py docstring].
-        self._run(self._drone.move_by_velocity_async(
+        coro = self._drone.move_by_velocity_async(
             float(v_north), float(v_east), float(v_down), float(duration_s),
             yaw_control_mode=YawControlMode.MaxDegreeOfFreedom,
-            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s)))
+            yaw_is_rate=True, yaw=self._ned_yaw_rate(yaw_rate_rad_s))
+        if wait:
+            self._run(coro)
+        else:
+            # RC-stick semantics: the FIRST await sends the command; the
+            # motion Task is kept (not awaited) so the vehicle keeps flying
+            # while the caller renders/detects, and the next command
+            # overrides this one (verified live on Blocks 1.0.1: a reverse
+            # sent mid-window flipped vx +0.42 -> -0.36 m/s). A blocking
+            # 0.1 s pulse per ~0.4 s loop tick gave the vehicle thrust only
+            # ~25% of wall time and starved the intercept eval.
+            self._pending = self._loop.run_until_complete(coro)
 
     def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
-                              duration_s) -> None:
+                              duration_s, wait: bool = True) -> None:
         # Route body-frame commands through the WORLD API. Measured on
         # Blocks 1.0.1 (2026-09-19): move_by_velocity_body_frame_async does
         # NOT actuate yaw at all (5/5 reps of a 2 s body yaw moved the
@@ -297,11 +324,34 @@ class ProjectAirSimEngine(EngineBase):
         v_north = v_fwd * c - v_right * s
         v_east = v_fwd * s + v_right * c
         self.move_by_velocity(v_north, v_east, v_down, yaw_rate_rad_s,
-                              duration_s)
+                              duration_s, wait=wait)
 
     def hover(self) -> None:
         self.move_by_velocity(0.0, 0.0, 0.0, 0.0, 0.1)
         self._parked = True
+
+    def get_speed(self) -> float:
+        """Ground-truth linear speed (m/s). Used to settle the vehicle to
+        rest between episodes."""
+        tw = self._drone.get_ground_truth_kinematics().get('twist', {})
+        lin = tw.get('linear', {}) if isinstance(tw, dict) else {}
+        return math.hypot(lin.get('x', 0.0), lin.get('y', 0.0),
+                          lin.get('z', 0.0))
+
+    def settle(self, max_speed: float = 0.2, max_ticks: int = 25) -> float:
+        """Hold a zero-velocity command until the vehicle is at rest, then
+        return the residual speed. A single 0.1 s hover does NOT arrest a
+        diving intercept policy (measured ~1 m/s residual on Blocks 1.0.1);
+        without this, the next episode's target is placed ahead of a still-
+        moving drone and the capture check trips on frame 1."""
+        v = self.get_speed()
+        for _ in range(max_ticks):
+            if v < max_speed:
+                break
+            self.move_by_velocity(0.0, 0.0, 0.0, 0.0, 0.1)
+            v = self.get_speed()
+        self._parked = True
+        return v
 
 
 class ClassicEngine(EngineBase):
@@ -406,26 +456,30 @@ class ClassicEngine(EngineBase):
         return -math.degrees(rep103_rad_s)
 
     def move_by_velocity(self, v_north, v_east, v_down, yaw_rate_rad_s,
-                         duration_s) -> None:
+                         duration_s, wait: bool = True) -> None:
         a = self._airsim
-        self._client.moveByVelocityAsync(
+        fut = self._client.moveByVelocityAsync(
             float(v_north), float(v_east), float(v_down), float(duration_s),
             drivetrain=a.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode=a.YawMode(is_rate=True,
                                yaw_or_rate=self._ned_yaw_rate_deg(
                                    yaw_rate_rad_s)),
-            vehicle_name=self.vehicle).join()
+            vehicle_name=self.vehicle)
+        if wait:
+            fut.join()             # fire-and-forget otherwise (RC stick)
 
     def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
-                              duration_s) -> None:
+                              duration_s, wait: bool = True) -> None:
         a = self._airsim
-        self._client.moveByVelocityBodyFrameAsync(
+        fut = self._client.moveByVelocityBodyFrameAsync(
             float(v_fwd), float(v_right), float(v_down), float(duration_s),
             drivetrain=a.DrivetrainType.MaxDegreeOfFreedom,
             yaw_mode=a.YawMode(is_rate=True,
                                yaw_or_rate=self._ned_yaw_rate_deg(
                                    yaw_rate_rad_s)),
-            vehicle_name=self.vehicle).join()
+            vehicle_name=self.vehicle)
+        if wait:
+            fut.join()             # fire-and-forget otherwise (RC stick)
 
     def hover(self) -> None:
         self._client.hoverAsync(vehicle_name=self.vehicle).join()
