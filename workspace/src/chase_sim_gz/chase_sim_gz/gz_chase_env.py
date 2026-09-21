@@ -111,11 +111,25 @@ class GzChaseEnv(gym.Env):
         self.backend.set_pose(self.follower, f_pos, 0.0)
         self.backend.set_pose(self.target, t_pos, 0.0)
         # set_pose is queued; hovering zero-commands also re-arm the
-        # controllers after the world reset re-instantiated them.
-        self.backend.send_twist(self.follower, (0, 0, 0), 0.0)
-        self.backend.send_twist(self.target, (0, 0, 0), 0.0)
-        # >= one odom publish period WITH margin (the backend refuses
-        # sub-period steps; exactly-one-period would ride float equality).
+        # controllers after the world reset re-instantiated them. HOLD
+        # ~1.5 s of sim time here, re-sending the zero command each
+        # control period: a single odom period (12 ms) read odometry
+        # mid-teleport-transient -- the vehicles were still dropping
+        # onto their hover setpoints, so the replay gate's first
+        # compared step was garbage and the gate failed spuriously.
+        # (Each chunk stays >= one odom publish period with margin; the
+        # backend refuses sub-period steps.)
+        for _ in range(15):
+            self.backend.send_twist(self.follower, (0, 0, 0), 0.0)
+            self.backend.send_twist(self.target, (0, 0, 0), 0.0)
+            self.backend.step(self.steps_per_control)
+        # The historical 12-step tail stays, and not only as the >= one
+        # odom-period-with-margin wait: it DE-PHASES the clock from the
+        # control grid, so `t - latency` never lands exactly on a
+        # measurement stamp (with latency an exact multiple of dt, a
+        # grid-aligned clock rides float equality in the delay pipe --
+        # observed as a frozen observation when the hold above was a
+        # clean multiple of the control period).
         self.backend.step(12)
 
         self._family = family

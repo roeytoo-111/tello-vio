@@ -39,13 +39,22 @@ class DelayQueue:
         while self._q and self._q[0][0] < cutoff:
             self._q.popleft()
 
+    # Comparison slack, far below any control period. When the latency is
+    # an exact multiple of dt, `t - latency` lands ON a stamp and the
+    # outcome of a bare <= rides accumulated float error -- and the error
+    # GROWS with sim time, so a backend whose clock starts later (e.g.
+    # after a reset settle hold) silently flips from inclusive to
+    # exclusive and the observation freezes at its pre-rolled value
+    # (measured on GzChaseEnv, 2026-09-21).
+    _EPS_S = 1e-9
+
     def sample(self, t: float) -> Optional[tuple]:
         """(t_meas, payload) of the newest entry with t_meas <= t, else None
         (the pipe is still empty at episode start unless pre-rolled).
         Scans from the newest end: the answer sits ~2-4 entries in at the
         measured delays, vs ~20 from the old end."""
         for t_meas, payload in reversed(self._q):
-            if t_meas <= t:
+            if t_meas <= t + self._EPS_S:
                 return (t_meas, payload)
         return None
 
