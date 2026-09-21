@@ -146,10 +146,21 @@ class ProjectAirSimEngine(EngineBase):
         # Lazy import: this module must be importable (and dry-runnable)
         # on machines without any engine installed.
         import asyncio
+        import threading
         from projectairsim import ProjectAirSimClient, World, Drone
-        # One private loop for the whole session: get_event_loop() outside
-        # a running loop is deprecated (an error from Python 3.14).
+        # One private loop for the whole session, RUNNING in a background
+        # thread. With the old run_until_complete-per-call pattern the
+        # loop was parked between calls, so a fire-and-forget motion
+        # Task's send/ack machinery only progressed when the NEXT call
+        # happened to pump the loop -- streamed commands carrying a
+        # vertical/yaw component were dropped into a dead hover (measured
+        # on Blocks 1.0.1, 2026-09-20). A live loop completes them in
+        # real time.
         self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True,
+            name='projectairsim-loop')
+        self._loop_thread.start()
         self._client = ProjectAirSimClient(address=self.address)
         self._client.connect()
         self._world = World(self._client, self.scene_config,
@@ -214,19 +225,38 @@ class ProjectAirSimEngine(EngineBase):
         two-stage: awaiting the coroutine only SENDS the request and
         returns the motion's own asyncio.Task, which must be awaited too
         (upstream hello_drone.py awaits twice). One await returns before
-        the vehicle has moved."""
-        task = self._loop.run_until_complete(coro)
-        return self._loop.run_until_complete(task)
+        the vehicle has moved. Both stages run on the background loop
+        thread; this thread only waits on their futures."""
+        import asyncio
+        task = asyncio.run_coroutine_threadsafe(
+            coro, self._loop).result(timeout=60)
+
+        async def _wait(t):
+            return await t
+        return asyncio.run_coroutine_threadsafe(
+            _wait(task), self._loop).result(timeout=120)
+
+    def _send(self, coro):
+        """SEND a command (first stage only). The returned motion Task
+        keeps progressing on the live background loop -- unlike the old
+        parked-loop version, its send/ack machinery completes in real
+        time, which is what makes fire-and-forget commands trustworthy."""
+        import asyncio
+        return asyncio.run_coroutine_threadsafe(
+            coro, self._loop).result(timeout=60)
 
     def disconnect(self) -> None:
+        import asyncio
+        if getattr(self, '_rc_thread', None) is not None:
+            self.rc_stop()
         if self._pending is not None and self._loop is not None:
             # Retire the last fire-and-forget Task before the sockets go
             # away, or asyncio warns 'Task was destroyed but it is
             # pending!' at interpreter exit.
-            import asyncio
-            self._pending.cancel()
             try:
-                self._loop.run_until_complete(asyncio.sleep(0))
+                self._loop.call_soon_threadsafe(self._pending.cancel)
+                asyncio.run_coroutine_threadsafe(
+                    asyncio.sleep(0), self._loop).result(timeout=5)
             except Exception:
                 pass
             self._pending = None
@@ -234,6 +264,10 @@ class ProjectAirSimEngine(EngineBase):
             self._client.disconnect()
             self._client = None
         if self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            if getattr(self, '_loop_thread', None) is not None:
+                self._loop_thread.join(timeout=5)
+                self._loop_thread = None
             self._loop.close()
             self._loop = None
 
@@ -299,14 +333,14 @@ class ProjectAirSimEngine(EngineBase):
         if wait:
             self._run(coro)
         else:
-            # RC-stick semantics: the FIRST await sends the command; the
-            # motion Task is kept (not awaited) so the vehicle keeps flying
-            # while the caller renders/detects, and the next command
-            # overrides this one (verified live on Blocks 1.0.1: a reverse
-            # sent mid-window flipped vx +0.42 -> -0.36 m/s). A blocking
-            # 0.1 s pulse per ~0.4 s loop tick gave the vehicle thrust only
-            # ~25% of wall time and starved the intercept eval.
-            self._pending = self._loop.run_until_complete(coro)
+            # RC-stick semantics: send and return; the motion Task keeps
+            # progressing on the live loop thread while the caller
+            # renders/detects, and the next command overrides this one
+            # (verified live on Blocks 1.0.1: a reverse sent mid-window
+            # flipped vx +0.42 -> -0.36 m/s). A blocking 0.1 s pulse per
+            # ~0.4 s loop tick gave the vehicle thrust only ~25% of wall
+            # time and starved the intercept eval.
+            self._pending = self._send(coro)
 
     def move_by_velocity_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s,
                               duration_s, wait: bool = True) -> None:
@@ -329,6 +363,72 @@ class ProjectAirSimEngine(EngineBase):
     def hover(self) -> None:
         self.move_by_velocity(0.0, 0.0, 0.0, 0.0, 0.1)
         self._parked = True
+
+    # ------------------------------------------------------------------
+    # RC bridge: a background thread that re-issues short BLOCKING
+    # velocity commands back-to-back -- the transport of last resort and
+    # the one that mirrors the real Tello (an RC bridge streams stick
+    # values continuously). Motivation, all measured on Blocks 1.0.1:
+    # fire-and-forget commands with a vertical component pin the vehicle
+    # in a dead hover; low tapered streamed speeds die mid-approach; and
+    # once pinned, neither settle() nor fresh streams revive it within
+    # the session. Blocking commands have never failed -- each arrives at
+    # an idle controller -- and back-to-back there is no gap to brake in.
+    # The caller updates the setpoint (converted to world frame on the
+    # caller's thread, so the bridge itself never issues pose reads);
+    # the bridge re-issues it via _run, whose run_coroutine_threadsafe
+    # submissions serialize all motion traffic on the loop thread.
+    # 0.4 s per re-issued command: simple_flight restarts its velocity
+    # ramp on every command arrival, so faster re-issue rates (0.15 s
+    # measured) leave the vehicle perpetually at ~0. At 0.4 s each
+    # command completes its window and the next follows with no gap --
+    # ~full duty at the highest arrival rate the controller tolerates.
+    _RC_TICK_S = 0.4
+
+    def rc_start(self) -> None:
+        import threading
+        if getattr(self, '_rc_thread', None) is not None:
+            return
+        self._rc_cmd = None
+        self._rc_active = True
+        self._rc_thread = threading.Thread(target=self._rc_loop,
+                                           daemon=True, name='rc-bridge')
+        self._rc_thread.start()
+
+    def _rc_loop(self) -> None:
+        import time as _time
+        while self._rc_active:
+            cmd = self._rc_cmd
+            if cmd is None:
+                _time.sleep(0.05)
+                continue
+            try:
+                self.move_by_velocity(cmd[0], cmd[1], cmd[2], cmd[3],
+                                      self._RC_TICK_S)
+            except Exception:
+                _time.sleep(0.05)
+
+    def rc_set_body(self, v_fwd, v_right, v_down, yaw_rate_rad_s) -> None:
+        """Update the bridge setpoint (body frame -> world here, on the
+        CALLER's thread, using the live heading)."""
+        (_, _, _), yaw = self.get_vehicle_pose()
+        c, s = math.cos(yaw), math.sin(yaw)
+        self._rc_cmd = (v_fwd * c - v_right * s,
+                        v_fwd * s + v_right * c,
+                        float(v_down), float(yaw_rate_rad_s))
+
+    def rc_pause(self) -> None:
+        """Stop issuing commands (bridge idles) -- call before settle()/
+        resets so the bridge does not fight them."""
+        self._rc_cmd = None
+
+    def rc_stop(self) -> None:
+        self._rc_active = False
+        t = getattr(self, '_rc_thread', None)
+        if t is not None:
+            t.join(timeout=3)
+            self._rc_thread = None
+        self._rc_cmd = None
 
     def get_speed(self) -> float:
         """Ground-truth linear speed (m/s). Used to settle the vehicle to
