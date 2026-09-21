@@ -45,10 +45,15 @@ chase_behaviour:
 chase_mixer:
   ros__parameters:
     # [!] UNMEASURED. Full-stick forward speed of this airframe, m/s, used
-    # only to turn the depth rule's metres/second into a stick. The
-    # simulator assumed 1.5 m/s. Setting this BELOW the truth makes the
-    # aircraft fly faster than intended, so err high until measured.
-    fwd_full_stick_mps: 1.5
+    # only to turn the depth rule's metres/second into a stick.
+    #   stick = v_command / fwd_full_stick_mps
+    # so a value BELOW the truth makes the aircraft fly FASTER than
+    # commanded. The manufacturer's figure for this airframe is 8 m/s; the
+    # simulator assumed 1.5, which is the dangerous direction. Until a step
+    # response is flown, err deliberately HIGH -- an under-responsive
+    # forward axis is a nuisance, an over-responsive one closes on another
+    # aircraft. chase_safety caps this axis separately at max_forward_stick.
+    fwd_full_stick_mps: 6.0
     stale_ticks: 3.0
 
 chase_safety:
@@ -59,6 +64,11 @@ chase_safety:
     # there is no position source, so there can be no lateral geofence.
     # 0.6 of full stick for first flights.
     max_stick: 0.6
+    # [D] The forward axis gets its own, much tighter cap because its stick
+    # scale above is unmeasured. 0.15 stick at the 6.0 placeholder is
+    # ~0.9 m/s; if the truth were 1.5 m/s it would be ~0.22 m/s. Both are
+    # survivable. Raise this only after the step response is measured.
+    max_forward_stick: 0.15
 
     # [D] Auto-disarm thresholds. The doc set names every one of these
     # rules and gives no numbers for any of them.
@@ -71,7 +81,8 @@ chase_safety:
     # (time-of-flight in its 0.1-1.2 m window, else the SDK's own estimate).
     height_max_m: 2.5
     height_min_m: 0.3
-    require_height: false    # true = refuse to fly without a height source
+    require_height: true     # a missing height source is a FAULT, not a skip
+    require_telemetry_to_arm: true   # never arm unsupervised
 
     flight_time_max_s: 0.0   # 0 disables; the battery floor is the real limit
     land_on_disarm: true

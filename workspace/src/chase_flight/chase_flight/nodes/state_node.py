@@ -91,6 +91,11 @@ class ChaseStateNode(Node):
         self._det = None            # newest DroneDetection
         self._det_stamp = None      # rclpy Time it arrived
         self._det_consumed = True   # consume-once: see _fresh_detection
+        # Last POSITIVE detection. The detector publishes a message for every
+        # frame INCLUDING misses, so message age is a detector-liveness
+        # signal and says nothing about whether the target is still there.
+        # The supervisor's target-loss rule needs this one.
+        self._last_seen = None
         self._last_action = np.zeros(self.spec.action_dim, dtype=np.float32)
 
         reliable = QoSProfile(depth=10)
@@ -178,6 +183,11 @@ class ChaseStateNode(Node):
             out.w_px = 0.0
             out.range_m = float('nan')
         out.detection_age_s = float(age if math.isfinite(age) else -1.0)
+        if meas is not None:
+            self._last_seen = now
+        out.time_since_detection_s = (
+            -1.0 if self._last_seen is None
+            else float((now - self._last_seen).nanoseconds / 1e9))
         self.pub.publish(out)
 
 

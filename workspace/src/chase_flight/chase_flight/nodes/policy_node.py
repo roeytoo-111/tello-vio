@@ -27,7 +27,7 @@ import time
 
 import numpy as np
 import rclpy
-from chase_msgs.msg import PolicyAction, TrackingState
+from chase_msgs.msg import PolicyAction, SafetyStatus, TrackingState
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
@@ -123,8 +123,19 @@ class ChasePolicyNode(Node):
         self.pub = self.create_publisher(PolicyAction, 'chase/action', qos)
         self.create_subscription(TrackingState, 'chase/observation',
                                  self._on_observation, qos)
+        # The rate limiter tracks the policy's own previous output, and the
+        # policy runs from the first second even while disarmed. Without
+        # this reset `_prev` can already be saturated at the moment of
+        # arming, so the limiter permits a 0 -> full-cap step on exactly the
+        # transition it exists to smooth.
+        self.create_subscription(SafetyStatus, 'chase/safety',
+                                 self._on_safety, qos)
 
     # ------------------------------------------------------------------
+    def _on_safety(self, msg: SafetyStatus):
+        if not msg.engaged:
+            self._prev[:] = 0.0
+
     def _on_observation(self, msg: TrackingState):
         if msg.obs_spec_hash != self.pol.obs_spec_hash:
             if not self._warned_hash:

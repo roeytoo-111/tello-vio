@@ -34,4 +34,16 @@ float32 staleness       # seconds since last detection / loss_timeout, capped 1
 # ref_width_m default differs (0.180 m prop span vs 0.098 m body width).
 float32 range_m         # NaN when not visible
 float32 w_px            # box width rescaled into the calibration frame
-float32 detection_age_s # age of the newest detection at assembly time
+
+# Age of the newest detection MESSAGE (the detector publishes one per frame
+# including misses), so this is a detector-liveness signal, NOT a
+# target-loss signal. -1 when none has ever arrived.
+float32 detection_age_s
+
+# Seconds since the last POSITIVE detection -- uncapped, unlike the
+# `staleness` element of the observation which saturates at 1.0 by the
+# spec. This is the target-loss signal the supervisor disarms on, and it
+# must be uncapped for a 30 s rule to be expressible at all.
+# Starts at -1 and stays there until the target is seen for the first
+# time, so "never acquired" is distinguishable from "recently seen".
+float32 time_since_detection_s

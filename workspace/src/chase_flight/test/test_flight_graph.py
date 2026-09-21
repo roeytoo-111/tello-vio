@@ -83,7 +83,8 @@ class Graph:
     """The six nodes plus a harness, spinning in a background thread."""
 
     def __init__(self, baseline='p_controller', **safety_over):
-        rclpy.init()
+        if not rclpy.ok():
+            rclpy.init()
         sp = dict(max_stick=MAX_STICK, publish_rate_hz=50.0,
                   start_armed=False, land_on_disarm=False,
                   telemetry_timeout_s=1e9, detection_timeout_s=1e9,
@@ -105,10 +106,14 @@ class Graph:
         self._t.start()
 
     def shutdown(self):
-        self.exec.shutdown()
-        for n in self.nodes + [self.harness]:
-            n.destroy_node()
-        rclpy.shutdown()
+        try:
+            self.exec.shutdown()
+            for n in self.nodes + [self.harness]:
+                n.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 @pytest.fixture
@@ -121,8 +126,12 @@ def graph(monkeypatch, request):
     defaults = dict(baseline=baseline, max_stick=MAX_STICK,
                     publish_rate_hz=50.0, land_on_disarm=False,
                     telemetry_timeout_s=1e9, detection_timeout_s=1e9,
-                    height_max_m=1e9, height_min_m=-1e9,
-                    control_rate_hz=20.0)
+                    height_max_m=50.0, height_min_m=-10.0,
+                    control_rate_hz=20.0,
+                    # No driver in these tests: the supervisor's telemetry
+                    # and height gates are exercised in test_safety.py.
+                    require_telemetry_to_arm=False, require_height=False,
+                    max_forward_stick=MAX_STICK)
     defaults.update(over)
 
     def patched(self, name, value=None, *a, **kw):
