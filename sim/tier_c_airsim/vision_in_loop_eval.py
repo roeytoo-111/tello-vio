@@ -112,8 +112,6 @@ def run_episode(eng, det, policy, cfg: EnvConfig, spec: ObservationSpec,
     # ends the previous episode at ~1 m/s, and without this the target is
     # placed ahead of a still-moving drone (spurious frame-1 captures). The
     # 0.1 s hover in the loop tail is not enough; this holds until at rest.
-    if hasattr(eng, 'rc_pause'):
-        eng.rc_pause()                 # bridge idles during the reset
     if hasattr(eng, 'settle'):
         eng.settle()
     # Reset geometry RELATIVE to the vehicle's live pose: the target goes
@@ -144,38 +142,20 @@ def run_episode(eng, det, policy, cfg: EnvConfig, spec: ObservationSpec,
         # drifts against controller lag and YOLO wall-time.
         v_up = float(a[0]) * cfg.v_max
         yaw_rate = float(a[1]) * cfg.omega_max
-        # RC-stick semantics under measured simple_flight rules (Blocks
-        # 1.0.1): streamed pure-horizontal commands chain at ~0.7 m/s,
-        # but vertical/yaw-carrying commands preempting a young stream pin
-        # the vehicle in a dead hover -- and a pinned vehicle is a TRAP:
-        # the static scene makes the policy emit big trim values, whose
-        # dense pulses keep re-pinning it (bistable; one run that got
-        # moving early stayed calm and closed 3.5 m). Three rules break
-        # the trap:  no trims during the warm-up ticks (let the stream
-        # establish), rate-limit trims afterwards, and if the vehicle is
-        # ever pinned while commanded forward, settle() and re-establish
-        # (a settle precedes every stream sequence measured to work).
-        # With the adapter's loop thread live, streamed fwd+yaw commands
-        # PASS (stream_probe.py, 2026-09-21) -- only a VERTICAL component
-        # still pins the vehicle. So the stream carries forward + yaw
-        # (closing and centring, the axes that matter) every tick, and
-        # the vertical axis alone is trimmed by rare short blocking
-        # pulses under warm-up/rate-limit guards; if a pulse ever pins
-        # the vehicle, the settle() recovery un-pins it.
         d_est = (C.FX * cfg.ref_width_m / max(meas.w_px, 1.0)
                  if meas is not None else None)
-        # Command transport: the RC bridge -- a background thread
-        # re-issuing short BLOCKING commands back-to-back, all axes,
-        # ~full duty (mirrors the real Tello's RC stream). Streamed
-        # (fire-and-forget) commands are unusable on Blocks 1.0.1
-        # simple_flight: any vertical component pins the vehicle, low
-        # tapered speeds die mid-approach, and the pinned state survives
-        # settle() (measured, 2026-09-20/21). The bridge only needs the
-        # setpoint refreshed here each tick.
-        if hasattr(eng, 'rc_set_body'):
-            eng.rc_set_body(v_fwd, 0.0, -v_up, yaw_rate)
-        else:
-            eng.move_by_velocity_body(v_fwd, 0.0, -v_up, yaw_rate, DT)
+        # Command transport: ONE blocking command per tick, main thread,
+        # 0.4 s window -- the single pattern with a 100% record across
+        # every engine session of 2026-09-19..21 (sign test, follow eval,
+        # the genuine 285-step capture). Everything cleverer is
+        # engine-mood-dependent on Blocks 1.0.1 simple_flight: streamed
+        # commands freeze per-connect (vertical always, yaw and even
+        # pure-forward on bad connects), and the threaded RC bridge froze
+        # 4/4 in a session whose streamed-forward flew. The 0.4 s window
+        # (vs the original 0.1 s) roughly doubles motion duty against the
+        # ~0.45 s render+YOLO gap; the vehicle brakes during the gap,
+        # which the policy tolerates (it was trained with latency).
+        eng.move_by_velocity_body(v_fwd, 0.0, -v_up, yaw_rate, 0.4)
         stats['steps'] += 1
         captured_now = (d_est is not None and cfg.task == 'intercept'
                         and d_est <= cfg.r_cap_m)
@@ -186,8 +166,6 @@ def run_episode(eng, det, policy, cfg: EnvConfig, spec: ObservationSpec,
                         captured_now)
         if captured_now:
             break
-    if hasattr(eng, 'rc_pause'):
-        eng.rc_pause()
     eng.hover()
     return stats
 
@@ -255,8 +233,6 @@ def main(argv=None):
         print(f'warehouse: {n_props} props, {n_lights} lights, '
               f'lighting={args.lighting}')
     eng.takeoff()                    # velocity commands need flight mode
-    if hasattr(eng, 'rc_start'):
-        eng.rc_start()               # the RC bridge drives all motion
     if args.save_frames:
         os.makedirs(args.save_frames, exist_ok=True)
     episodes = []

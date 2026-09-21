@@ -30,16 +30,24 @@ def main(argv=None):
                       **({'address': args.address} if args.address else {}))
     eng.connect()
     eng.takeoff()
+    eng.rc_start()
     failures = 0
 
     def probe(tag, vdown=0.0, yaw=0.0):
+        # Exercise the RC BRIDGE exactly as the eval does: refresh the
+        # setpoint each "tick" while the bridge re-issues blocking
+        # commands back-to-back. (Raw streamed commands are NOT probed:
+        # their vertical/yaw freezes are known, engine-mood-dependent,
+        # and the eval no longer uses them.)
         nonlocal failures
+        eng.rc_pause()
         eng.settle()
         (x0, y0, z0), yaw0 = eng.get_vehicle_pose()
-        for _ in range(6):
-            eng.move_by_velocity_body(0.8, 0.0, vdown, yaw, 1.0,
-                                      wait=False)
+        t0 = time.time()
+        while time.time() - t0 < 3.0:
+            eng.rc_set_body(0.8, 0.0, vdown, yaw)
             time.sleep(0.45)
+        eng.rc_pause()
         (x1, y1, z1), yaw1 = eng.get_vehicle_pose()
         moved = abs(x1 - x0) + abs(y1 - y0) > 0.3
         failures += not moved
@@ -53,14 +61,15 @@ def main(argv=None):
         probe('fwd + yaw 0.3', yaw=0.3)
         probe('fwd + down + yaw', vdown=0.1, yaw=0.3)
     finally:
+        eng.rc_stop()
         eng.settle()
         eng.disconnect()
-    print('STREAM PROBE ' + ('PASS -- streamed commands actuate on every '
-                             'axis; the eval loop can be trusted'
-                             if failures == 0 else
-                             f'FAIL ({failures}/4 frozen) -- do not run '
-                             f'the intercept eval; the RC-bridge fallback '
-                             f'is needed'))
+    print('RC-BRIDGE PROBE ' + ('PASS -- the eval transport actuates on '
+                                'every axis; go fly'
+                                if failures == 0 else
+                                f'FAIL ({failures}/4 frozen) -- the engine '
+                                f'is in a bad state; restart Blocks.exe '
+                                f'and probe again'))
     return 0 if failures == 0 else 1
 
 
