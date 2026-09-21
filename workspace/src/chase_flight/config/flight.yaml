@@ -1,0 +1,78 @@
+# Flight parameters for the chase stack.
+#
+# PROVENANCE MARKERS
+#   [V]  verified against the code or a measurement on this hardware
+#   [D]  a design decision made here; the doc set names the knob but fixes
+#        no value
+#   [!]  UNMEASURED on the real aircraft -- a placeholder that a Phase-1
+#        step-response test must replace before it can be trusted
+#
+# Nothing in this file was tuned in flight. Every [D] and [!] value is a
+# conservative first-flight starting point.
+
+/**:
+  ros__parameters:
+    # 10 Hz. [V] This is the deployment constant: the Gym environment's
+    # step WAS 0.1 s, so the policy's learned velocities only mean what
+    # they meant in training at this rate. It is also forced from below by
+    # the driver's 0.35 s dead-man.
+    control_rate_hz: 10.0
+
+chase_state:
+  ros__parameters:
+    # A detection older than this is not this tick's measurement. [D]
+    detection_timeout_s: 1.0
+
+chase_policy:
+  ros__parameters:
+    # Per-step, per-axis clamp on the change in action. [D] The Tello's
+    # sticks saturate quickly and an unconstrained policy judders; the
+    # source work considered penalising abrupt changes in the reward and
+    # dropped it for training complexity, so it is done here instead.
+    rate_limit: 0.5
+    prefer_onnx: true
+
+chase_behaviour:
+  ros__parameters:
+    # All four [D]. The design set names exactly these knobs and leaves
+    # every value to the implementer.
+    lost_ticks: 5            # 0.5 s at 10 Hz before TRACK concedes
+    reacquire_hold_s: 1.0    # hold position first, then rotate
+    patrol_after_s: 8.0      # REACQUIRE -> PATROL
+    search_yaw: 0.25         # slow enough that the detector sees what it passes
+    patrol_yaw: 0.20
+
+chase_mixer:
+  ros__parameters:
+    # [!] UNMEASURED. Full-stick forward speed of this airframe, m/s, used
+    # only to turn the depth rule's metres/second into a stick. The
+    # simulator assumed 1.5 m/s. Setting this BELOW the truth makes the
+    # aircraft fly faster than intended, so err high until measured.
+    fwd_full_stick_mps: 1.5
+    stale_ticks: 3.0
+
+chase_safety:
+  ros__parameters:
+    publish_rate_hz: 20.0    # [V] must exceed the driver's 0.35 s dead-man
+
+    # [D] Speed cap. On this platform the cap IS the safety envelope --
+    # there is no position source, so there can be no lateral geofence.
+    # 0.6 of full stick for first flights.
+    max_stick: 0.6
+
+    # [D] Auto-disarm thresholds. The doc set names every one of these
+    # rules and gives no numbers for any of them.
+    battery_floor: 0.20      # fraction, not percent (the driver publishes 0..1)
+    telemetry_timeout_s: 1.0 # link loss
+    command_timeout_s: 0.30  # must stay under the driver's 0.35 s dead-man
+    detection_timeout_s: 30.0  # prolonged target loss -> land
+
+    # [D] Altitude limits. These ARE enforceable: height is measured
+    # (time-of-flight in its 0.1-1.2 m window, else the SDK's own estimate).
+    height_max_m: 2.5
+    height_min_m: 0.3
+    require_height: false    # true = refuse to fly without a height source
+
+    flight_time_max_s: 0.0   # 0 disables; the battery floor is the real limit
+    land_on_disarm: true
+    start_armed: false       # ALWAYS false: arming is an operator act

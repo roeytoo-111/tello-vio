@@ -19,6 +19,10 @@ find_package(builtin_interfaces REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/DroneDetection.msg"
+  "msg/TrackingState.msg"
+  "msg/PolicyAction.msg"
+  "msg/FlightMode.msg"
+  "msg/SafetyStatus.msg"
   DEPENDENCIES std_msgs builtin_interfaces
   ADD_LINTER_TESTS
 )

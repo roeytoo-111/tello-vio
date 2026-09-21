@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://relaxng.org/ns/structure/1.0"?>
+<package format="3">
+  <name>chase_flight</name>
+  <version>0.1.0</version>
+  <description>
+    Real-time flight stack for the vision-based drone chase: the six nodes
+    that put a trained policy on the aircraft (state, policy, depth_rule,
+    behaviour, mixer, safety).
+
+    It imports chase_gym for the observation assembler, the forward-speed
+    law and the constants -- the same modules the trainer used -- so the
+    aircraft and the simulator cannot drift apart. torch / onnxruntime are
+    pip dependencies with no rosdep key and are therefore not declared
+    below; onnxruntime is used for inference when an exported actor is
+    present, torch only to read the checkpoint bundle's metadata.
+  </description>
+  <maintainer email="roey.turgeman@aerosentry.tech">Roey Turgeman</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>builtin_interfaces</exec_depend>
+  <exec_depend>chase_msgs</exec_depend>
+  <exec_depend>tello_msg</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
