@@ -189,6 +189,11 @@ class ChaseSafetyNode(Node):
                 return
         self._cmd = t
         self._cmd_t = self.get_clock().now()
+        # Event-driven: gate and forward the new command immediately rather
+        # than holding it until the next 20 Hz tick (up to 50 ms of pure,
+        # untrained-for delay). The timer still runs, and is what keeps the
+        # driver's 0.35 s dead-man fed when no new command arrives.
+        self._tick()
 
     def _on_state(self, msg: TrackingState):
         self._det_t = self.get_clock().now()

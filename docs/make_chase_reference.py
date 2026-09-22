@@ -117,8 +117,8 @@ def build_cover():
         ['Tier&nbsp;C follow mission, vision in the loop', '100 % over 1,500 frames'],
         ['Detector precision (with drone-free frames in the exam)', '0.996'],
         ['Verified interception in the rendered warehouse', '3.6 m chase, caught at 0.48 m'],
-        ['Flight-stack nodes implemented and integration-tested', '6 nodes, 7 tests'],
-        ['Total automated tests passing without hardware', '94'],
+        ['Flight-stack nodes implemented and tested', '6 nodes, 18 tests'],
+        ['Total automated tests passing without hardware', '105'],
     ]
     st += table([[Paragraph(a, TD), Paragraph(f'<b>{b}</b>', TD)] for a, b in rows],
                 widths=[112 * mm, 52 * mm], header=False)
@@ -973,11 +973,12 @@ def sec7():
         '[!] The one unmeasured number in the control path',
         'Converting the depth rule\'s metres per second into a stick requires '
         'the airframe\'s full-stick forward speed. It has never been measured '
-        'on this aircraft; the simulator assumed 1.5&nbsp;m/s and the launch '
-        'default repeats that assumption. Setting it <i>below</i> the truth '
-        'makes the aircraft fly faster than intended, so it must err high '
-        'until a step-response test replaces it. This is item&nbsp;1 of the '
-        'bring-up procedure.', 'warn')
+        'on this aircraft. The simulator assumed 1.5&nbsp;m/s, but setting '
+        'this <i>below</i> the truth makes the aircraft fly faster than '
+        'intended, and the manufacturer quotes 8&nbsp;m/s &mdash; so the '
+        'shipped default is a deliberately <b>high</b> 6.0&nbsp;m/s, and the '
+        'supervisor caps the forward axis separately at 0.15 of full stick. '
+        'Measuring the real value is item&nbsp;1 of the bring-up procedure.', 'warn')
 
     st += h2('7.6&nbsp;&nbsp;chase_safety &mdash; the supervisor')
     st += para(
@@ -987,7 +988,9 @@ def sec7():
 
     st += h2('7.7&nbsp;&nbsp;How it is tested without an aircraft')
     st += para(
-        'Seven integration tests start all six real nodes in one process, '
+        'Seven integration tests start all six real nodes in one process '
+        '(eleven more, in a separate file, attack the supervisor\'s fault '
+        'logic &mdash; Section&nbsp;8.2), '
         'inject synthetic detections and assert on what reaches '
         '<font face="Courier">/cmd_vel</font>:')
     st += bullets([
@@ -1005,6 +1008,68 @@ def sec7():
         'consume-once defect described in Section&nbsp;7.1 &mdash; a bug that '
         'would have made the aircraft believe it could still see a target it '
         'had lost, for as long as the timeout allowed.', 'good')
+
+    st += h2('7.8&nbsp;&nbsp;Is Python fast enough? (measured)')
+    st += para(
+        'No code runs on the Tello itself &mdash; it has no user-programmable '
+        'computer. All six nodes run on the ground laptop, which sends stick '
+        'values to the aircraft over Wi-Fi. The question is therefore whether '
+        'Python on the laptop keeps up with a 10&nbsp;Hz control loop. It was '
+        'measured rather than assumed.')
+    rows = [
+        ['Step (per control tick)', 'Median', 'p99'],
+        ['Policy inference, ONNX', '11.5 &micro;s', '27 &micro;s'],
+        ['Observation assembly', '10.8 &micro;s', '32 &micro;s'],
+        ['Forward law', '2.2 &micro;s', '4 &micro;s'],
+        ['Detection &rarr; measurement', '1.1 &micro;s', '2 &micro;s'],
+        ['<b>Total compute</b>', '<b>~26 &micro;s = 0.03 % of the 100 ms period</b>', ''],
+    ]
+    st += table([rows[0]] + [[Paragraph(a, TD), Paragraph(b, TDC), Paragraph(c, TDC)]
+                             for a, b, c in rows[1:]],
+                widths=[62 * mm, 72 * mm, 30 * mm])
+    st += para(
+        'A C++ rewrite would save perhaps twenty microseconds per tick against '
+        'a Wi-Fi video link that is 150&ndash;350&nbsp;<i>milliseconds</i> '
+        'late. The expensive work &mdash; YOLO inference and H.264 decoding '
+        '&mdash; already runs in compiled CUDA/C++ kernels underneath Python, '
+        'and the Tello driver this stack sits on is itself Python.')
+    st += para(
+        'What <i>did</i> matter was the architecture. Measuring the six nodes '
+        'as separate processes, from a detection being published to the '
+        'command reaching <font face="Courier">/cmd_vel</font>, exposed a '
+        'defect that no language change would have fixed:')
+    rows = [
+        ['Design', 'Median latency', 'Worst case'],
+        ['Mixer and supervisor on their own timers',
+         '94&ndash;151 ms, <i>varied by launch</i>', '125&ndash;200 ms'],
+        ['Mixer and supervisor react to each new input (current)',
+         '<b>51&ndash;61 ms, consistent</b>', '<b>~103 ms</b>'],
+        ['&hellip; with all 16 CPU cores saturated',
+         '61 ms', '103 ms'],
+    ]
+    st += table([rows[0]] + [[Paragraph(a, TD), Paragraph(b, TD), Paragraph(c, TD)]
+                             for a, b, c in rows[1:]],
+                widths=[78 * mm, 50 * mm, 36 * mm])
+    st += callout(
+        'Timers were adding delay the policy never trained with',
+        ['When the mixer and the supervisor each waited for their own clock '
+         'tick, a fresh action sat idle for up to 100&nbsp;ms and then up to '
+         '50&nbsp;ms more &mdash; and because each timer started at a random '
+         'moment, the total depended on when the stack was launched. Two '
+         'clean runs of identical code measured 94&nbsp;ms and 151&nbsp;ms.',
+         'Both nodes now react the instant an input arrives, keeping their '
+         'timers only as watchdogs. What remains is the state node\'s own '
+         '100&nbsp;ms tick, which <i>is</i> modelled in training: the '
+         'simulator also samples measurements at step boundaries. The '
+         'longest gap between commands stayed at ~57&nbsp;ms even under full '
+         'CPU load &mdash; six times inside the driver\'s 350&nbsp;ms '
+         'dead-man.'], 'good')
+    st += para(
+        'Where C++ <i>would</i> become justified: moving the stack onto an '
+        'onboard computer with little CPU (a Jetson or a microcontroller '
+        'board), running the detector at high frame rates on CPU, or needing '
+        'hard real-time guarantees that no Python executor can give. None of '
+        'those apply to a laptop driving a Tello over Wi-Fi.')
     return st
 
 
@@ -1027,14 +1092,22 @@ def sec8():
          'on the wire is exactly zero. The policy runs, publishes and is '
          'recorded from the first second &mdash; it simply does not reach the '
          'aircraft.', 'starts <b>DISARMED</b>'],
-        ['<b>Speed cap</b>', 'Every axis clamped before it is sent. On this '
-         'airframe this <i>is</i> the safety envelope.', '0.6 of full stick [D]'],
-        ['<b>Dead-man feed</b>', 'Publishes at 20 Hz with hold-last-command '
-         'semantics, so the driver\'s 0.35 s dead-man is always fed and a '
-         'stalled upstream node stops the aircraft.', '20 Hz [V]'],
+        ['<b>Speed cap</b>', 'Every axis clamped before it is sent, and a '
+         'non-finite value becomes zero, never a deflection. On this airframe '
+         'this <i>is</i> the safety envelope. The forward axis has its own, '
+         'tighter cap because its stick scale is unmeasured.',
+         '0.6 stick; forward 0.15 [D]'],
+        ['<b>Dead-man feed</b>', 'Forwards each new command immediately, and '
+         'republishes the last one at 20 Hz, so the driver\'s 0.35 s dead-man is '
+         'always fed and a stalled upstream node stops the aircraft.',
+         '20 Hz + on arrival [V]'],
         ['<b>Auto-disarm</b>', 'Latches disarmed and commands a land on any '
-         'of: link loss, low battery, prolonged target loss, altitude breach, '
-         'or a stale mixer.', 'see below'],
+         'of: link loss, low battery, prolonged target loss, a target never '
+         'acquired, altitude breach, a stalled state node, or /emergency. '
+         'Every rule <b>fails closed</b>: a missing input is a fault.',
+         'see 8.1'],
+        ['<b>Arming</b>', 'Edge-triggered, and refused until telemetry exists '
+         'and any latched fault has actually cleared.', 'operator act'],
     ]
     st += table([rows[0]] + [[Paragraph(a, TD), Paragraph(b, TD), Paragraph(c, TD)]
                              for a, b, c in rows[1:]],
@@ -1056,12 +1129,13 @@ def sec8():
     rows = [
         ['Threshold', 'Default', 'Provenance'],
         ['Speed cap', '0.6 stick', '[D] conservative first-flight value'],
+        ['Forward-axis cap', '0.15 stick', '[D] tighter, because the forward scale is unmeasured'],
         ['Battery floor', '20 %', '[D] &mdash; the source material names the rule, no number'],
         ['Link-loss timeout', '1.0 s', '[D]'],
         ['Stale-command timeout', '0.30 s', '[V] must stay under the driver\'s 0.35 s'],
         ['Prolonged target loss', '30 s', '[D]'],
         ['Altitude window', '0.3 &ndash; 2.5 m', '[D], but enforceable &mdash; height is measured'],
-        ['Forward stick scale', '1.5 m/s', '<b>[!] UNMEASURED</b> &mdash; see Section 7.5'],
+        ['Forward stick scale', '6.0 m/s', '<b>[!] UNMEASURED</b> &mdash; deliberately high; see Section 7.5'],
     ]
     st += table([rows[0]] + [[Paragraph(a, TD), Paragraph(b, TDC), Paragraph(c, TD)]
                              for a, b, c in rows[1:]],
@@ -1071,6 +1145,51 @@ def sec8():
         'which names every rule and fixes no value. They are stated here as '
         'choices so that they can be argued with, rather than buried as '
         'defaults.')
+
+    st += h2('8.2&nbsp;&nbsp;What an adversarial review found')
+    st += para(
+        'The first version of the supervisor was reviewed against the '
+        'driver\'s real behaviour by an agent instructed to find ways it '
+        'could hurt the aircraft. It found several, each now fixed and pinned '
+        'by a test. They are recorded here because each one looked correct '
+        'on reading:')
+    rows = [
+        ['Defect', 'Why it was invisible', 'Consequence'],
+        ['<b>NaN became full deflection</b>',
+         '<font face="Courier">min(0.6, nan)</font> returns 0.6 &mdash; '
+         'min/max do not clamp NaN, and the "was it capped?" test compares '
+         'against NaN and says no.',
+         'One bad number &rarr; +0.6 stick on every axis, reported as normal.'],
+        ['<b>Target-loss rule could never fire</b>',
+         'It keyed on detection <i>message</i> age, but the detector sends a '
+         'message every frame including misses &mdash; ~33 ms, forever.',
+         'A lost target patrols until the battery dies.'],
+        ['<b>Every rule failed open</b>',
+         'A rule whose input had never arrived was skipped rather than '
+         'tripped.',
+         'Arm before the driver connects &rarr; a live policy, unsupervised.'],
+        ['<b>Level-triggered arming</b>',
+         '<font face="Courier">ros2 topic pub</font> without '
+         '<font face="Courier">-1</font> republishes at 1 Hz.',
+         'Every latched fault cleared once a second, forever.'],
+        ['<b>Altitude floor on the ground</b>',
+         'Height reads ~0 before take-off.',
+         'Could not arm &mdash; inviting the operator to disable the floor.'],
+        ['<b>/emergency did not disarm</b>',
+         'The motor cut went to the driver only.',
+         'A live policy resumed the moment anyone sent /takeoff.'],
+    ]
+    st += table([rows[0]] + [[Paragraph(a, TD), Paragraph(b, TD), Paragraph(c, TD)]
+                             for a, b, c in rows[1:]],
+                widths=[40 * mm, 66 * mm, 58 * mm])
+    st += callout(
+        'Why none of this was caught by the original tests',
+        'The integration tests had to switch every auto-disarm rule off in '
+        'order to exercise the control path &mdash; they have no driver to '
+        'supply telemetry. So the supervisor\'s fault logic was, until the '
+        'review, entirely untested. A second test file now does the opposite: '
+        'it drives the supervisor alone and asserts that each rule fires, and '
+        'that each one fails closed.', 'warn')
     return st
 
 
@@ -1096,7 +1215,7 @@ def sec9():
         ['The intercept mission can genuinely complete',
          'Verified capture at <b>0.48 m</b>, frame on record'],
         ['The flight stack behaves correctly without hardware',
-         '<b>7</b> integration tests on all six nodes; <b>94</b> tests total'],
+         '<b>18</b> flight-stack tests, including every supervisor fault rule; <b>105</b> total'],
     ]
     st += table([rows[0]] + [[Paragraph(a, TD), Paragraph(b, TD)] for a, b in rows[1:]],
                 widths=[92 * mm, 72 * mm])

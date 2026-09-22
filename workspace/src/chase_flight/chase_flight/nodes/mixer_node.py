@@ -40,10 +40,16 @@ frame, so its output carries no information about where to point:
     REACQUIRE (hold)   everything 0 -- hold position, do not coast
     REACQUIRE (rotate) behaviour owns yaw; z = 0; x = 0
 
-The mixer is timer-driven, not message-driven, so that it keeps emitting
-even when an upstream node goes quiet: a stale input is zeroed on its own
-axis and the fact is published, which is strictly safer than a gap on the
-wire that the safety supervisor would have to interpret.
+TIMING. The mixer re-mixes and publishes the moment ANY input arrives, and
+also on a control-rate timer that acts only as a watchdog. It used to be
+purely timer-driven, and measurement showed that design cost more latency
+than anything else in the stack: a new action waited up to a full 100 ms
+for the mixer's own tick (and then up to 50 ms more for the supervisor's),
+while the computation itself takes ~0.03 ms. None of that waiting exists
+in training, where an action is applied in the same step it is computed --
+so it was pure train/deploy skew. The watchdog timer is kept so that the
+mixer still emits, with stale axes zeroed, if every upstream node goes
+quiet.
 """
 import numpy as np
 import rclpy
@@ -63,13 +69,14 @@ class ChaseMixerNode(Node):
         super().__init__('chase_mixer')
 
         self.declare_parameter('control_rate_hz', C.CONTROL_RATE_HZ)
-        # [D][UNMEASURED] Full-stick forward speed of this airframe, m/s.
-        # The simulation assumed 1.5 m/s; the real value is unknown until a
-        # step-response test is flown. A LOWER value here makes the
-        # aircraft fly FASTER for a given commanded m/s (stick = v / scale),
-        # so the conservative direction is to keep this at or above the
-        # truth. Measure it before trusting the forward axis.
-        self.declare_parameter('fwd_full_stick_mps', 1.5)
+        # [!][UNMEASURED] Full-stick forward speed of this airframe, m/s.
+        # A LOWER value here makes the aircraft fly FASTER for a given
+        # commanded m/s (stick = v / scale), so the conservative direction
+        # is to keep this at or above the truth. The simulator assumed 1.5,
+        # the manufacturer quotes 8 -- this in-code default must be as safe
+        # as the shipped YAML, so that running the node without its config
+        # file cannot silently pick the dangerous value.
+        self.declare_parameter('fwd_full_stick_mps', 6.0)
         # Inputs older than this many control periods are treated as absent.
         self.declare_parameter('stale_ticks', 3.0)
 
@@ -104,14 +111,17 @@ class ChaseMixerNode(Node):
     def _on_action(self, msg: PolicyAction):
         self._action = np.asarray(msg.action, dtype=np.float32)
         self._action_t = self.get_clock().now()
+        self._tick()                # event-driven: publish now
 
     def _on_forward(self, msg: TwistStamped):
         self._fwd_mps = float(msg.twist.linear.x)
         self._fwd_t = self.get_clock().now()
+        self._tick()                # event-driven: publish now
 
     def _on_mode(self, msg: FlightMode):
         self._mode = msg
         self._mode_t = self.get_clock().now()
+        self._tick()                # event-driven: publish now
 
     def _age(self, t):
         if t is None:
